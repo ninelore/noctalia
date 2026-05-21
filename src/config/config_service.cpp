@@ -870,6 +870,16 @@ void ConfigService::seedBuiltinWidgets(Config& config) {
   ram.settings["stat"] = std::string("ram_used");
   seed("ram", std::move(ram));
 
+  WidgetConfig netTx;
+  netTx.type = "sysmon";
+  netTx.settings["stat"] = std::string("net_tx");
+  seed("network_tx", std::move(netTx));
+
+  WidgetConfig netRx;
+  netRx.type = "sysmon";
+  netRx.settings["stat"] = std::string("net_rx");
+  seed("network_rx", std::move(netRx));
+
   WidgetConfig outputVolume;
   outputVolume.type = "volume";
   outputVolume.settings["device"] = std::string("output");

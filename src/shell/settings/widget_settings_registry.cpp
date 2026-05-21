@@ -210,6 +210,12 @@ namespace settings {
       if (name == "input_volume") {
         return tr("settings.widgets.instances.input-volume");
       }
+      if (name == "network_tx") {
+        return tr("settings.widgets.instances.network-tx");
+      }
+      if (name == "network_rx") {
+        return tr("settings.widgets.instances.network-rx");
+      }
       return std::string(name);
     }
 

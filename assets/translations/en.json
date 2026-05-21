@@ -1037,6 +1037,8 @@
         "date": "Date",
         "input-volume": "Input Volume",
         "output-volume": "Output Volume",
+        "network-rx": "Network RX",
+        "network-tx": "Network TX",
         "ram": "RAM",
         "temp": "Temperature"
       },
