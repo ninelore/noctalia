@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace compositors::triad {
@@ -87,16 +88,19 @@ private:
   void parseMessages();
   [[nodiscard]] bool handleMessage(std::string_view line);
   [[nodiscard]] bool applyTriadState(const nlohmann::json& state);
+  [[nodiscard]] bool applyOutputs(const nlohmann::json& outputs);
   [[nodiscard]] bool applyLayoutState(const nlohmann::json& state);
   [[nodiscard]] bool applyWindows(const nlohmann::json& windows);
   [[nodiscard]] bool applyWindow(const nlohmann::json& window);
   [[nodiscard]] static std::optional<WorkspaceState> parseWorkspace(const nlohmann::json& json);
   [[nodiscard]] static std::optional<WindowState> parseWindow(const nlohmann::json& json);
   [[nodiscard]] static std::string workspaceKey(const WorkspaceState& workspace);
+  [[nodiscard]] static bool isSyntheticPlaceholder(const WorkspaceState& workspace);
   [[nodiscard]] static std::optional<std::uint64_t> jsonUnsigned(const nlohmann::json& json);
   [[nodiscard]] static std::string jsonString(const nlohmann::json& json, const char* key);
   [[nodiscard]] static bool jsonBool(const nlohmann::json& json, const char* key);
   [[nodiscard]] std::string outputNameFor(wl_output* output) const;
+  [[nodiscard]] bool shouldExposeWorkspace(const WorkspaceState& workspace, const std::string& outputName = {}) const;
   [[nodiscard]] std::vector<const WorkspaceState*> sortedWorkspaces(const std::string& outputName = {}) const;
   [[nodiscard]] std::optional<std::uint32_t> parseWorkspaceIndex(const std::string& id) const;
   void refreshSnapshot();
@@ -106,6 +110,7 @@ private:
   compositors::triad::TriadRuntime& m_runtime;
   int m_socketFd = -1;
   std::vector<char> m_readBuffer;
+  std::unordered_set<std::string> m_outputNames;
   std::unordered_map<std::uint32_t, WorkspaceState> m_workspaces;
   std::unordered_map<std::uint64_t, WindowState> m_windows;
   bool m_overviewKnown = false;

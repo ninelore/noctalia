@@ -287,6 +287,7 @@ void TriadWorkspaceBackend::focusWindow(const std::string& windowId) {
 void TriadWorkspaceBackend::cleanup() {
   closeSocket(false);
   const bool overviewWasOpen = m_overviewKnown && m_overviewOpen;
+  m_outputNames.clear();
   m_workspaces.clear();
   m_windows.clear();
   m_overviewKnown = false;
@@ -507,6 +508,9 @@ bool TriadWorkspaceBackend::applyTriadState(const nlohmann::json& state) {
     }
   }
 
+  if (const auto* outputs = arrayField(state, "outputs"); outputs != nullptr && applyOutputs(*outputs)) {
+    changed = true;
+  }
   if (applyLayoutState(state)) {
     changed = true;
   }
@@ -517,6 +521,27 @@ bool TriadWorkspaceBackend::applyTriadState(const nlohmann::json& state) {
     changed = true;
   }
   return changed;
+}
+
+bool TriadWorkspaceBackend::applyOutputs(const nlohmann::json& outputs) {
+  if (!outputs.is_array()) {
+    return false;
+  }
+
+  std::unordered_set<std::string> next;
+  for (const auto& output : outputs) {
+    const auto name = jsonString(output, "name");
+    if (!name.empty()) {
+      next.insert(name);
+    }
+  }
+
+  if (next == m_outputNames) {
+    return false;
+  }
+
+  m_outputNames = std::move(next);
+  return true;
 }
 
 bool TriadWorkspaceBackend::applyLayoutState(const nlohmann::json& state) {
@@ -665,6 +690,10 @@ std::string TriadWorkspaceBackend::workspaceKey(const WorkspaceState& workspace)
   return workspace.index > 0 ? std::to_string(workspace.index) : std::string{};
 }
 
+bool TriadWorkspaceBackend::isSyntheticPlaceholder(const WorkspaceState& workspace) {
+  return workspace.output.rfind("triad-", 0) == 0 && !workspace.active && !workspace.occupied && !workspace.urgent;
+}
+
 std::optional<std::uint64_t> TriadWorkspaceBackend::jsonUnsigned(const nlohmann::json& json) {
   if (json.is_number_unsigned()) {
     return json.get<std::uint64_t>();
@@ -698,13 +727,30 @@ std::string TriadWorkspaceBackend::outputNameFor(wl_output* output) const {
   return output != nullptr && m_outputNameResolver ? m_outputNameResolver(output) : std::string{};
 }
 
+bool TriadWorkspaceBackend::shouldExposeWorkspace(const WorkspaceState& workspace,
+                                                  const std::string& outputName) const {
+  if (!outputName.empty()) {
+    return workspace.output == outputName;
+  }
+  if (isSyntheticPlaceholder(workspace)) {
+    return false;
+  }
+  if (m_outputNames.empty() || workspace.output.empty()) {
+    return true;
+  }
+  if (m_outputNames.contains(workspace.output)) {
+    return true;
+  }
+  return workspace.active || workspace.occupied || workspace.urgent;
+}
+
 std::vector<const TriadWorkspaceBackend::WorkspaceState*>
 TriadWorkspaceBackend::sortedWorkspaces(const std::string& outputName) const {
   std::vector<const WorkspaceState*> result;
   result.reserve(m_workspaces.size());
   for (const auto& [index, workspace] : m_workspaces) {
     (void)index;
-    if (!outputName.empty() && workspace.output != outputName) {
+    if (!shouldExposeWorkspace(workspace, outputName)) {
       continue;
     }
     result.push_back(&workspace);
