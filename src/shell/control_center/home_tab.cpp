@@ -484,7 +484,11 @@ std::unique_ptr<Flex> HomeTab::create() {
     grid->addChild(std::move(btn));
   }
 
-  bottomRow->addChild(std::move(grid));
+  if (!m_shortcutPads.empty()) {
+    bottomRow->addChild(std::move(grid));
+  } else {
+    m_shortcutsGrid = nullptr;
+  }
   tab->addChild(std::move(bottomRow));
 
   return tab;
