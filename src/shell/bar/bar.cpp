@@ -1463,15 +1463,19 @@ void Bar::populateWidgets(BarInstance& instance) {
   const FontWeight labelFontWeight = static_cast<FontWeight>(instance.barConfig.fontWeight);
   auto createWidgets = [&](const std::vector<std::string>& names, std::vector<std::unique_ptr<Widget>>& dest) {
     for (const auto& name : names) {
+      const WidgetConfig* wcPtr = nullptr;
+      if (auto it = widgetConfigs.find(name); it != widgetConfigs.end()) {
+        wcPtr = &it->second;
+      }
+      const float contentScale =
+          resolveWidgetContentScale(instance.barConfig.scale, wcPtr, "widget." + name + ".scale");
       auto widget = m_widgetFactory->create(
-          name, instance.output, instance.barConfig.scale, instance.barConfig.position, instance.barConfig.name,
+          name, instance.output, contentScale, instance.barConfig.position, instance.barConfig.name,
           static_cast<float>(instance.barConfig.widgetSpacing)
       );
       if (widget != nullptr) {
         widget->setConfigName(name);
-        const WidgetConfig* wcPtr = nullptr;
-        if (auto it = widgetConfigs.find(name); it != widgetConfigs.end()) {
-          wcPtr = &it->second;
+        if (wcPtr != nullptr) {
           widget->setAnchor(wcPtr->getBool("anchor", false));
         }
         widget->setBarCapsuleSpec(resolveWidgetBarCapsuleSpec(instance.barConfig, wcPtr));

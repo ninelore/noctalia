@@ -252,6 +252,8 @@ struct WidgetConfig {
 // Merges `[bar.*]` capsule defaults with `[widget.*]` overrides (see CONFIG.md). Size/style fields such as
 // `radius` are populated even when `enabled` is false so widgets can reuse capsule styling internally.
 [[nodiscard]] WidgetBarCapsuleSpec resolveWidgetBarCapsuleSpec(const BarConfig& bar, const WidgetConfig* widget);
+[[nodiscard]] float
+resolveWidgetContentScale(float barScale, const WidgetConfig* widget, std::string_view context = "widget.scale");
 
 // Color spec for user color strings: either a palette color role token or a hex color.
 [[nodiscard]] ColorSpec colorSpecFromConfigString(const std::string& raw, std::string_view context = {});

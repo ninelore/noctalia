@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -359,6 +360,31 @@ WidgetBarCapsuleSpec resolveWidgetBarCapsuleSpec(const BarConfig& bar, const Wid
     spec.foreground = std::nullopt;
   }
   return spec;
+}
+
+float resolveWidgetContentScale(float barScale, const WidgetConfig* widget, std::string_view context) {
+  if (widget == nullptr) {
+    return barScale;
+  }
+
+  const auto it = widget->settings.find("scale");
+  if (it == widget->settings.end()) {
+    return barScale;
+  }
+
+  double widgetScale = 1.0;
+  if (const auto* raw = std::get_if<double>(&it->second)) {
+    if (!std::isfinite(*raw)) {
+      throw std::runtime_error(std::string(context) + ": expected finite number");
+    }
+    widgetScale = *raw;
+  } else if (const auto* raw = std::get_if<std::int64_t>(&it->second)) {
+    widgetScale = static_cast<double>(*raw);
+  } else {
+    throw std::runtime_error(std::string(context) + ": expected finite number");
+  }
+
+  return barScale * std::clamp(static_cast<float>(widgetScale), 0.2f, 8.0f);
 }
 
 ColorSpec colorSpecFromConfigString(const std::string& raw, std::string_view context) {

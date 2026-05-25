@@ -95,6 +95,7 @@ namespace settings {
         return "grouping";
       }
       if (key == "anchor"
+          || key == "scale"
           || key == "color"
           || key == "font_weight"
           || key == "capsule"

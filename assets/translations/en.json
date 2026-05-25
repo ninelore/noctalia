@@ -1185,6 +1185,10 @@
           "label": "Color",
           "description": "Color role for widget foreground; fixed hex colors are also supported"
         },
+        "scale": {
+          "label": "Scale",
+          "description": "Scale this widget relative to the bar content scale"
+        },
         "font_weight": {
           "label": "Font Weight",
           "description": "Font weight for this widget's labels"

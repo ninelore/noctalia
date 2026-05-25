@@ -189,6 +189,18 @@ namespace {
     }
   }
 
+  void validateWidgetScaleSetting(std::string_view widgetName, const WidgetConfig& widget) {
+    if (!widget.hasSetting("scale")) {
+      return;
+    }
+    (void)resolveWidgetContentScale(1.0f, &widget, "widget." + std::string(widgetName) + ".scale");
+  }
+
+  void validateWidgetSettings(std::string_view widgetName, const WidgetConfig& widget) {
+    validateWidgetColorSettings(widgetName, widget);
+    validateWidgetScaleSetting(widgetName, widget);
+  }
+
   void validateDesktopWidgetColorSettings(const DesktopWidgetState& widget) {
     for (const auto& [key, value] : widget.settings) {
       if (!isDesktopWidgetColorSetting(widget.type, key)) {
@@ -1321,7 +1333,7 @@ void ConfigService::parseTableInto(const toml::table& tbl, Config& config, bool 
         }
       }
 
-      validateWidgetColorSettings(widgetName, wc);
+      validateWidgetSettings(widgetName, wc);
       config.widgets[widgetName] = std::move(wc);
     }
   }

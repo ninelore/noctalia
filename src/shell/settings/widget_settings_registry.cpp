@@ -441,6 +441,7 @@ namespace settings {
     const WidgetSettingVisibility capsuleOn{"capsule", {"true"}};
 
     auto anchor = boolSpec("anchor", false, true);
+    auto scale = doubleSpec("scale", 1.0, 0.2, 8.0, 0.05);
     auto widgetColor = colorSpec("color", {}, true);
     std::vector<WidgetSettingSelectOption> fontWeightOptions;
     fontWeightOptions.reserve(kFontWeightOptions.size() + 1);
@@ -474,8 +475,9 @@ namespace settings {
     capsuleGroup.visibleWhen = capsuleOn;
 
     return {
-        std::move(anchor),         std::move(widgetColor),    std::move(fontWeight),    std::move(capsuleToggle),
-        std::move(capsuleRadius),  std::move(capsuleFill),    std::move(capsuleBorder), std::move(capsuleForeground),
+        std::move(anchor),         std::move(scale),          std::move(widgetColor),
+        std::move(fontWeight),     std::move(capsuleToggle),  std::move(capsuleRadius),
+        std::move(capsuleFill),    std::move(capsuleBorder),  std::move(capsuleForeground),
         std::move(capsulePadding), std::move(capsuleOpacity), std::move(capsuleGroup),
     };
   }
