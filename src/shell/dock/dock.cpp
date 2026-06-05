@@ -13,6 +13,7 @@
 #include "shell/dock/dock_instance.h"
 #include "shell/dock/dock_items.h"
 #include "shell/dock/dock_model.h"
+#include "shell/dock/pinned_apps.h"
 #include "shell/panel/panel_manager.h"
 #include "shell/surface/shadow.h"
 #include "shell/tooltip/tooltip_manager.h"
@@ -735,6 +736,7 @@ void Dock::openItemMenu(shell::dock::DockInstance& instance, const shell::dock::
   const std::string entryId = action.entry.id;
   const std::string entryWorkingDir = action.entry.workingDir;
   const bool entryTerminal = action.entry.terminal;
+  const DesktopEntry entryForPin = action.entry;
 
   shell::dock::DockMenuCallbacks callbacks{
       .activateWindow = [this](zwlr_foreign_toplevel_handle_v1* handle) { m_platform->activateToplevel(handle); },
@@ -745,6 +747,22 @@ void Dock::openItemMenu(shell::dock::DockInstance& instance, const shell::dock::
                 desktopAction, entryId, entryWorkingDir, entryTerminal,
                 dockLaunchOptions(*m_platform, *m_config, nullptr)
             );
+          },
+      .setEntryPinned =
+          [this, entryForPin](bool pinned) {
+            if (m_config == nullptr) {
+              return;
+            }
+            std::vector<std::string> pinnedList = m_config->config().dock.pinned;
+            if (pinned) {
+              if (shell::dock::pinned_apps::containsEntry(pinnedList, entryForPin)) {
+                return;
+              }
+              pinnedList.push_back(entryForPin.id);
+            } else {
+              shell::dock::pinned_apps::removeEntry(pinnedList, entryForPin);
+            }
+            (void)m_config->setOverride({"dock", "pinned"}, std::move(pinnedList));
           },
       .closeMenu = [this]() { closeItemMenu(); },
   };
