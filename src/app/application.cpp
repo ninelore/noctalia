@@ -1571,7 +1571,8 @@ void Application::initUi() {
   });
   m_overviewLauncherCapture.sync();
   m_panelManager.registerPanel(
-      "wallpaper", std::make_unique<WallpaperPanel>(&m_wayland, &m_configService, &m_thumbnailService)
+      "wallpaper",
+      std::make_unique<WallpaperPanel>(&m_wayland, &m_configService, &m_thumbnailService, &m_wallpaperScanner)
   );
   std::size_t trayDrawerColumns = 3;
   if (const auto it = m_configService.config().widgets.find("tray"); it != m_configService.config().widgets.end()) {
@@ -2425,6 +2426,7 @@ std::vector<PollSource*> Application::currentPollSources() {
   sources.push_back(&m_weatherPollSource);
   sources.push_back(&m_calendarPollSource);
   sources.push_back(&m_thumbnailService);
+  sources.push_back(&m_wallpaperScanner);
   sources.push_back(&m_asyncTextureCache);
   return sources;
 }

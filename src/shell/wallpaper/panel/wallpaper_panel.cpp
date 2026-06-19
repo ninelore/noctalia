@@ -193,6 +193,11 @@ namespace {
     if (entry.isDir || entry.absPath.string().starts_with("color:")) {
       return std::nullopt;
     }
+    // Scanned entries carry the mtime captured during the directory walk, so the
+    // sort comparator never stats. Pinned favorites lack it and stat once here.
+    if (entry.hasMtime) {
+      return entry.mtime;
+    }
     std::error_code ec;
     const auto mtime = std::filesystem::last_write_time(entry.absPath, ec);
     if (ec) {
@@ -344,17 +349,26 @@ private:
   StarCallback m_onStarToggle;
 };
 
-WallpaperPanel::WallpaperPanel(WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails)
-    : m_wayland(wayland), m_config(config), m_thumbnails(thumbnails) {
+WallpaperPanel::WallpaperPanel(
+    WaylandConnection* wayland, ConfigService* config, ThumbnailService* thumbnails, WallpaperScanner* scanner
+)
+    : m_wayland(wayland), m_config(config), m_thumbnails(thumbnails), m_scanner(scanner) {
   if (m_config != nullptr) {
     m_flatten = m_config->stateBool("wallpaper_panel", "flatten").value_or(false);
     if (const std::optional<std::string> sort = m_config->stateString("wallpaper_panel", "sort")) {
       m_sortMode = sortModeFromState(*sort);
     }
   }
+  if (m_scanner != nullptr) {
+    m_scanner->setOnComplete([this]() { onScanComplete(); });
+  }
 }
 
-WallpaperPanel::~WallpaperPanel() = default;
+WallpaperPanel::~WallpaperPanel() {
+  if (m_scanner != nullptr) {
+    m_scanner->setOnComplete(nullptr);
+  }
+}
 
 PanelPlacement WallpaperPanel::panelPlacement() const noexcept {
   return m_config == nullptr ? PanelPlacement::Attached : m_config->config().shell.panel.wallpaperPlacement;
@@ -525,7 +539,9 @@ void WallpaperPanel::create() {
           .padding = Style::spaceXs * scale,
           .radius = Style::scaledRadiusMd(scale),
           .onClick = [this]() {
-            m_scanner.invalidate();
+            if (m_scanner != nullptr) {
+              m_scanner->invalidate();
+            }
             refreshVisibleEntries();
             resetSelection();
             rebindGrid();
@@ -703,6 +719,32 @@ void WallpaperPanel::create() {
       })
   );
 
+  // Loading state shown while the directory scan runs on the worker thread.
+  // Occupies the body in place of the grid (only one is visible at a time).
+  root->addChild(
+      ui::column(
+          {
+              .out = &m_loadingBox,
+              .align = FlexAlign::Center,
+              .justify = FlexJustify::Center,
+              .gap = Style::spaceMd * scale,
+              .fillWidth = true,
+              .flexGrow = 1.0f,
+              .visible = false,
+          },
+          ui::spinner({
+              .out = &m_spinner,
+              .spinnerSize = Style::fontSizeTitle * scale * 1.6f,
+              .spinning = false,
+          }),
+          ui::label({
+              .text = i18n::tr("wallpaper.panel.loading"),
+              .fontSize = Style::fontSizeBody * scale,
+              .color = colorSpecFromRole(ColorRole::OnSurfaceVariant),
+          })
+      )
+  );
+
   setRoot(std::move(root));
   if (m_animations != nullptr) {
     this->root()->setAnimationManager(m_animations);
@@ -832,6 +874,9 @@ void WallpaperPanel::onClose() {
   m_favoritePaletteSourceSegmented = nullptr;
   m_favoritePaletteDetailSelect = nullptr;
   m_grid = nullptr;
+  m_loadingBox = nullptr;
+  m_spinner = nullptr;
+  m_scanPending = false;
 
   clearReleasedRoot();
   m_lastWidth = 0.0f;
@@ -1155,14 +1200,52 @@ void WallpaperPanel::syncThemeControls() {
 
 void WallpaperPanel::refreshScan() {
   const auto dir = activeDirectoryForSelection();
-  if (!dir.empty()) {
-    m_scanner.scan(dir, m_flatten);
+  if (dir.empty() || m_scanner == nullptr) {
+    m_scanPending = false;
+    return;
   }
+  // requestScan() returns false when a worker scan was queued — the entries
+  // arrive later via onScanComplete(). A cached/fresh dir returns true.
+  m_scanPending = !m_scanner->requestScan(dir, m_flatten);
 }
 
 void WallpaperPanel::refreshVisibleEntries() {
   refreshScan();
   applyFilter();
+  syncLoadingState();
+}
+
+void WallpaperPanel::onScanComplete() {
+  // The scanner outlives the panel's UI; ignore late results after teardown.
+  if (m_rootLayout == nullptr) {
+    return;
+  }
+  const auto dir = activeDirectoryForSelection();
+  m_scanPending = !dir.empty() && m_scanner != nullptr && m_scanner->scanning(dir, m_flatten);
+
+  applyFilter();
+  rebindGrid();
+  syncBrowseChrome();
+  syncLoadingState();
+  m_dirty = true;
+  PanelManager::instance().refresh();
+}
+
+void WallpaperPanel::syncLoadingState() {
+  const bool loading = m_scanPending;
+  if (m_loadingBox != nullptr) {
+    m_loadingBox->setVisible(loading);
+  }
+  if (m_grid != nullptr) {
+    m_grid->setVisible(!loading);
+  }
+  if (m_spinner != nullptr) {
+    if (loading) {
+      m_spinner->start();
+    } else {
+      m_spinner->stop();
+    }
+  }
 }
 
 void WallpaperPanel::applyFilter() {
@@ -1173,13 +1256,13 @@ void WallpaperPanel::applyFilter() {
   appendFilteredFavoriteEntries(m_visibleEntries, favoritePaths, dir, rootDir);
   m_pinnedFavoriteCount = m_visibleEntries.size();
 
-  if (!dir.empty()) {
-    const auto& result = m_scanner.scan(dir, m_flatten);
-
+  const WallpaperScanResult* result =
+      (dir.empty() || m_scanner == nullptr) ? nullptr : m_scanner->cached(dir, m_flatten);
+  if (result != nullptr) {
     const std::string needle = StringUtils::toLower(m_filterQuery);
     const bool filterActive = !needle.empty();
-    m_visibleEntries.reserve(m_visibleEntries.size() + result.entries.size());
-    for (const auto& entry : result.entries) {
+    m_visibleEntries.reserve(m_visibleEntries.size() + result->entries.size());
+    for (const auto& entry : result->entries) {
       if (!entry.isDir) {
         const std::string normalized = FileUtils::normalizeWallpaperPath(entry.absPath.string());
         if (favoritePaths.contains(normalized)) {

@@ -80,6 +80,7 @@
 #include "shell/settings/settings_window.h"
 #include "shell/switcher/window_switcher.h"
 #include "shell/tray/tray_menu.h"
+#include "shell/wallpaper/panel/wallpaper_scanner.h"
 #include "shell/wallpaper/wallpaper.h"
 #include "system/battery_warning_monitor.h"
 #include "system/brightness_poll_source.h"
@@ -232,6 +233,7 @@ private:
   SharedTextureCache m_sharedTextureCache;
   RenderContext m_renderContext;
   ThumbnailService m_thumbnailService;
+  WallpaperScanner m_wallpaperScanner;
   Bar m_bar;
   Dock m_dock;
   DesktopWidgetsController m_desktopWidgetsController;
