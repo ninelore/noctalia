@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <filesystem>
 #include <pwd.h>
 #include <security/pam_appl.h>
 #include <sys/types.h>
@@ -214,14 +213,6 @@ namespace {
   }
 
 } // namespace
-
-bool PamAuthenticator::pamServiceExists(std::string_view name) {
-  if (name.empty()) {
-    return false;
-  }
-  std::error_code ec;
-  return std::filesystem::exists(std::filesystem::path("/etc/pam.d") / name, ec) && !ec;
-}
 
 PamAuthenticator::Result
 PamAuthenticator::authenticateCurrentUser(std::string_view password, std::string_view service) const {
