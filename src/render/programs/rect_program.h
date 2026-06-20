@@ -47,11 +47,11 @@ private:
   GLint m_borderWidthLocation = -1;
   GLint m_outerShadowLocation = -1;
   GLint m_shadowCutoutOffsetLocation = -1;
-  GLint m_unionShapeLocation = -1;
-  GLint m_unionOffsetLocation = -1;
-  GLint m_unionSizeLocation = -1;
-  GLint m_unionCornerShapesLocation = -1;
-  GLint m_unionLogicalInsetLocation = -1;
-  GLint m_unionRadiiLocation = -1;
+  GLint m_shadowExclusionLocation = -1;
+  GLint m_shadowExclusionOffsetLocation = -1;
+  GLint m_shadowExclusionSizeLocation = -1;
+  GLint m_shadowExclusionCornerShapesLocation = -1;
+  GLint m_shadowExclusionLogicalInsetLocation = -1;
+  GLint m_shadowExclusionRadiiLocation = -1;
   GLint m_transformLocation = -1;
 };

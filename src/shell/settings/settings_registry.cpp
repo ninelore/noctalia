@@ -86,6 +86,16 @@ namespace settings {
       };
     }
 
+    StepperSetting barPanelOverlapStepper(std::int32_t value) {
+      return StepperSetting{
+          .value = static_cast<int>(value),
+          .minValue = -2,
+          .maxValue = 3,
+          .step = 1,
+          .valueSuffix = "px",
+      };
+    }
+
     std::optional<int> radiusStepperValue(const std::optional<double>& value) {
       if (!value.has_value()) {
         return std::nullopt;
@@ -2276,6 +2286,16 @@ namespace settings {
           section, "effects", tr("settings.schema.shared.shadow.label"), tr("settings.schema.bar.shadow.description"),
           path("shadow"), ToggleSetting{bar.shadow}, "shadow"
       ));
+      entries.push_back(makeEntry(
+          section, "effects", tr("settings.schema.shared.contact-shadow.label"),
+          tr("settings.schema.bar.contact-shadow.description"), path("contact_shadow"),
+          ToggleSetting{bar.contactShadow}, "shadow contact panel attached"
+      ));
+      entries.push_back(makeEntry(
+          section, "layout", tr("settings.schema.bar.panel-overlap.label"),
+          tr("settings.schema.bar.panel-overlap.description"), path("panel_overlap"),
+          barPanelOverlapStepper(bar.panelOverlap), "seam gap overlap attached panel fractional scale", true
+      ));
       const std::string barResolvedFontFamily =
           bar.fontFamily && !bar.fontFamily->empty() ? *bar.fontFamily : cfg.shell.fontFamily;
       {
@@ -2528,6 +2548,17 @@ namespace settings {
         entries.push_back(makeEntry(
             section, "effects", tr("settings.schema.shared.shadow.label"), tr("settings.schema.bar.shadow.description"),
             monitorPath("shadow"), ToggleSetting{ovr.shadow.value_or(bar.shadow)}, "shadow"
+        ));
+        entries.push_back(makeEntry(
+            section, "effects", tr("settings.schema.shared.contact-shadow.label"),
+            tr("settings.schema.bar.contact-shadow.description"), monitorPath("contact_shadow"),
+            ToggleSetting{ovr.contactShadow.value_or(bar.contactShadow)}, "shadow contact panel attached"
+        ));
+        entries.push_back(makeEntry(
+            section, "layout", tr("settings.schema.bar.panel-overlap.label"),
+            tr("settings.schema.bar.panel-overlap.description"), monitorPath("panel_overlap"),
+            barPanelOverlapStepper(ovr.panelOverlap.value_or(bar.panelOverlap)),
+            "seam gap overlap attached panel fractional scale", true
         ));
         {
           const std::string monitorInheritedFontFamily = bar.fontFamily.value_or(cfg.shell.fontFamily);

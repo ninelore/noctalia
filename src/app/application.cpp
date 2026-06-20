@@ -1702,6 +1702,11 @@ void Application::initUi() {
     }
     m_settingsWindow.openToBarWidget(std::move(barName), std::move(widgetName));
   });
+  m_panelManager.setAttachedPanelGeometryCallback(
+      [this](wl_output* output, std::string_view barName, std::optional<AttachedPanelGeometry> geometry) {
+        m_bar.setAttachedPanelGeometry(output, barName, geometry);
+      }
+  );
   m_panelManager.setClickShieldExcludeRectsProvider([this](wl_output* output) {
     return m_bar.surfaceRectsForOutput(output);
   });
@@ -1709,57 +1714,8 @@ void Application::initUi() {
   m_panelManager.setAttachedPanelAvailabilityCallback([this](wl_output* output, std::string_view barName) {
     return m_bar.canAttachPanelToBar(output, barName);
   });
-  m_panelManager.setHostAttachedPanelCallback(
-      [this](
-          wl_output* output, std::string_view barName, std::unique_ptr<Node> content, float mainLen, float innerLen,
-          float radius, float inset, std::function<void(Renderer&, float, float)> layout, std::function<void()> closed
-      ) {
-        return m_bar.openHostedAttachedPanel(
-            output, barName, std::move(content), mainLen, innerLen, radius, inset, std::move(layout), std::move(closed)
-        );
-      }
-  );
-  m_panelManager.setCloseHostedPanelCallback([this](wl_output* output, std::string_view barName) {
-    m_bar.closeHostedAttachedPanel(output, barName);
-  });
-  m_panelManager.setDestroyHostedPanelCallback([this](wl_output* output, std::string_view barName) {
-    m_bar.tearDownHostedAttachedPanelImmediate(output, barName);
-  });
-  m_panelManager.setReopenHostedPanelCallback([this](wl_output* output, std::string_view barName) {
-    return m_bar.reopenHostedAttachedPanel(output, barName);
-  });
-  m_panelManager.setRequestHostedPanelLayoutCallback([this](wl_output* output, std::string_view barName) {
-    m_bar.requestHostedPanelLayout(output, barName);
-  });
-  m_panelManager.setRequestHostedPanelRedrawCallback([this](wl_output* output, std::string_view barName) {
-    m_bar.requestHostedPanelRedraw(output, barName);
-  });
-  m_panelManager.setRequestHostedPanelFrameTickCallback([this](wl_output* output, std::string_view barName) {
-    m_bar.requestHostedPanelFrameTick(output, barName);
-  });
-  m_panelManager.setHostedPanelAnimationManagerQuery([this](wl_output* output, std::string_view barName) {
-    return m_bar.hostedPanelAnimationManager(output, barName);
-  });
-  m_panelManager.setHostedPopupParentContextQuery([this](wl_output* output, std::string_view barName) {
-    return m_bar.hostedPanelPopupParentContext(output, barName);
-  });
-  m_panelManager.setHostedPanelFocusCallback([this](wl_output* output, std::string_view barName, InputArea* area) {
-    m_bar.setHostedPanelFocus(output, barName, area);
-  });
-  m_panelManager.setDispatchHostedPanelKeyCallback(
-      [this](
-          wl_output* output, std::string_view barName, std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers,
-          bool pressed, bool preedit
-      ) { m_bar.dispatchHostedPanelKey(output, barName, sym, utf32, modifiers, pressed, preedit); }
-  );
-  m_panelManager.setHostedPanelPopupContextCallback(
-      [this](wl_output* output, std::string_view barName, SelectPopupContext* context) {
-        m_bar.setHostedPanelPopupContext(output, barName, context);
-      }
-  );
-  m_bar.setHostedPanelFrameTickCallback([this](float deltaMs) { m_panelManager.onHostedPanelFrameTick(deltaMs); });
-  m_bar.setHostedPanelReadyCallback([this](wl_output* output, std::string_view barName) {
-    m_panelManager.onHostedPanelReady(output, barName);
+  m_panelManager.setAttachedPanelBarSettledCallback([this](wl_output* output, std::string_view barName) {
+    return m_bar.isAttachedPanelBarSettled(output, barName);
   });
   m_bar.setAutoHideSuppressionCallback([this](const BarInstance& instance) {
     if (m_trayMenu.isOpen()) {

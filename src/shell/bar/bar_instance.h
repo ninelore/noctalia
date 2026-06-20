@@ -10,7 +10,6 @@
 #include "wayland/layer_surface.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -18,7 +17,6 @@
 class Box;
 class Flex;
 class Node;
-class Renderer;
 
 struct BarCapsuleRun {
   Node* shell = nullptr;
@@ -61,6 +59,7 @@ struct BarInstance {
   Node* shadowRightClip = nullptr;
   Box* shadowLeft = nullptr;
   Box* shadowRight = nullptr;
+  Box* attachedPanelResizeTestRect = nullptr;
   Node* contentClip = nullptr;
   Node* startSlot = nullptr;
   Node* centerSlot = nullptr;
@@ -77,19 +76,7 @@ struct BarInstance {
   std::vector<BarCapsuleRun> endCapsuleRuns;
 
   Signal<>::ScopedConnection paletteConn;
-
-  // Bar-hosted attached panel: real panel content rendered inside this bar's surface.
-  // clip/content nodes live under slideRoot (sibling of contentClip); content holds the
-  // panel's released root and slides during the reveal.
-  Node* hostedPanelClip = nullptr;
-  Node* hostedPanelContent = nullptr;
-  bool hostedPanelOpen = false;
-  float hostedPanelProgress = 0.0f;
-  float hostedPanelMainLen = 0.0f;  // content extent along the bar main axis (logical px)
-  float hostedPanelInnerLen = 0.0f; // content extent along the inner axis (logical px)
-  float hostedPanelRadius = 0.0f;
-  float hostedPanelInset = 0.0f; // padding between the tab edge and the panel content
-  bool hostedPanelReadyFired = false;
-  std::function<void(Renderer&, float, float)> hostedPanelLayout;
-  std::function<void()> hostedPanelClosed;
+  std::optional<AttachedPanelGeometry> attachedPanelGeometry;
+  bool attachedPanelResizeTestOpen = false;
+  std::uint32_t attachedPanelResizeTestExtent = 0;
 };

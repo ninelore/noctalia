@@ -46,8 +46,6 @@ namespace scripting {
 }
 struct PointerEvent;
 struct wl_surface;
-class InputArea;
-class SelectPopupContext;
 
 class Bar {
 public:
@@ -77,9 +75,6 @@ public:
   void refresh();
   void requestLayout();
   void setAutoHideSuppressionCallback(std::function<bool(const BarInstance&)> callback);
-  // Fired once a hosted attached panel's surface has grown and laid out, so the owner can
-  // (re)arm outside-click dismissal with the grown bar surface bounds.
-  void setHostedPanelReadyCallback(std::function<void(wl_output*, std::string_view)> callback);
   // Re-run auto-hide after a panel closes so unrelated bars are not left visible.
   void reevaluateAutoHide();
   void setOpenWidgetSettingsCallback(std::function<void(std::string, std::string)> callback);
@@ -98,52 +93,15 @@ public:
   // Returns every bar wl_surface across all outputs. Used as the focus-grab
   // whitelist on Hyprland so bar widgets keep receiving clicks.
   [[nodiscard]] std::vector<wl_surface*> allBarSurfaces() const;
+  void
+  setAttachedPanelGeometry(wl_output* output, std::string_view barName, std::optional<AttachedPanelGeometry> geometry);
   [[nodiscard]] bool canAttachPanelToBar(wl_output* output, std::string_view barName) const noexcept;
+  // True when an attached panel may start its reveal animation: non-autohide bars, or autohide
+  // bars that have finished sliding into their resting position.
+  [[nodiscard]] bool isAttachedPanelBarSettled(wl_output* output, std::string_view barName) const noexcept;
   void revealAutoHideForAttachedPanel(wl_output* output, std::string_view barName);
   void beginAttachedPopup(wl_surface* surface);
   void endAttachedPopup(wl_surface* surface);
-
-  // Host an attached panel's content inside this bar's own surface. `content` is the
-  // panel's released root; `contentMainLen`/`contentInnerLen` are its logical size along
-  // the bar main / inner axes; `layout` lays the content out for a given region size.
-  // Returns the host bar's wl_surface (target for dismissal/keyboard) or nullptr if the
-  // bar cannot host. The reveal animation is driven internally.
-  [[nodiscard]] wl_surface* openHostedAttachedPanel(
-      wl_output* output, std::string_view barName, std::unique_ptr<Node> content, float contentMainLen,
-      float contentInnerLen, float radius, float contentInset, std::function<void(Renderer&, float, float)> layout,
-      std::function<void()> closed
-  );
-  void closeHostedAttachedPanel(wl_output* output, std::string_view barName);
-  // Immediate (non-animated) teardown — used when a hosted panel is preempted by another
-  // panel opening, so the reopen starts from a clean base state.
-  void tearDownHostedAttachedPanelImmediate(wl_output* output, std::string_view barName);
-  // If the hosted panel on this bar is mid-close, cancel the retract and re-reveal its
-  // existing content (no teardown/recreate). Returns true if it re-revealed.
-  [[nodiscard]] bool reopenHostedAttachedPanel(wl_output* output, std::string_view barName);
-  // Hosted panel content lives in the bar's scene graph, so its relayout/redraw/frame-tick
-  // requests (driven by the owning Panel) must be forwarded to the hosting bar surface.
-  void requestHostedPanelLayout(wl_output* output, std::string_view barName);
-  void requestHostedPanelRedraw(wl_output* output, std::string_view barName);
-  void requestHostedPanelFrameTick(wl_output* output, std::string_view barName);
-  // Keyboard for a hosted panel: the content's focus areas + text inputs live in the bar's input
-  // dispatcher, so set the initial keyboard focus and route key events there.
-  void setHostedPanelFocus(wl_output* output, std::string_view barName, InputArea* area);
-  void dispatchHostedPanelKey(
-      wl_output* output, std::string_view barName, std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers,
-      bool pressed, bool preedit
-  );
-  // Install the Select-dropdown popup context on the hosted content subtree so Select controls
-  // inside a hosted panel open their dropdown against the bar's layer surface.
-  void setHostedPanelPopupContext(wl_output* output, std::string_view barName, SelectPopupContext* context);
-  // The AnimationManager that drives a hosted panel's content. The Panel animates against
-  // this (not PanelManager's own manager) so the bar surface ticks its animations.
-  [[nodiscard]] AnimationManager* hostedPanelAnimationManager(wl_output* output, std::string_view barName) const;
-  // Popup-parent context (bar layer surface + grown size) for popups opened by a hosted panel,
-  // e.g. the audio device menu. Hosted panels have no PanelManager surface to anchor against.
-  [[nodiscard]] std::optional<LayerPopupParentContext>
-  hostedPanelPopupParentContext(wl_output* output, std::string_view barName) const;
-  // Invoked each frame on the hosting bar surface so the owner can tick the hosted Panel.
-  void setHostedPanelFrameTickCallback(std::function<void(float)> callback);
 
   void registerIpc(IpcService& ipc);
 
@@ -179,17 +137,9 @@ private:
   [[nodiscard]] std::string hideBarIpc(std::string_view args);
   [[nodiscard]] std::string toggleBarIpc(std::string_view args);
   [[nodiscard]] std::string setBarAutoHideIpc(std::string_view args);
-  void applyHostedPanelReveal(BarInstance& instance, float progress);
-  void positionHostedPanelContent(BarInstance& instance, float progress);
-  // Runs the hosted panel's content layout + repositions it for the current reveal. Called
-  // from buildScene (on grow) and prepareFrame (on relayout requested by the hosted Panel).
-  void layoutHostedPanelContent(BarInstance& instance, Renderer& renderer, float w, float h);
-  void tearDownHostedPanel(BarInstance& instance, bool invokeClosed);
-  // While a panel is hosted the bar surface holds keyboard focus. On compositors with the
-  // Hyprland focus-grab, hold Exclusive only long enough to acquire focus, then relax to OnDemand
-  // so the grab manages focus (Exclusive otherwise fights it: keys only flow with the pointer over
-  // the bar, outside-clicks don't clear the grab, and focus isn't returned on close).
-  void armHostedPanelKeyboardRelax(BarInstance& instance);
+  [[nodiscard]] std::string attachedPanelResizeTestIpc(std::string_view args);
+  [[nodiscard]] std::uint32_t attachedPanelResizeTestMaxExtent(const BarInstance& instance) const;
+  void setAttachedPanelResizeTestOpen(BarInstance& instance, bool open, std::uint32_t extent);
   [[nodiscard]] std::optional<std::string> collectBarIpcInstances(
       std::optional<std::string_view> barName, std::optional<std::string_view> monitorSelector,
       std::vector<BarInstance*>& instancesOut
@@ -239,8 +189,6 @@ private:
   std::unordered_map<wl_surface*, BarInstance*> m_surfaceMap;
   BarInstance* m_hoveredInstance = nullptr;
   std::function<bool(const BarInstance&)> m_autoHideSuppressionCallback;
-  std::function<void(wl_output*, std::string_view)> m_hostedPanelReadyCallback;
-  std::function<void(float)> m_hostedPanelFrameTickCallback;
   std::function<void(std::string, std::string)> m_openWidgetSettingsCallback;
   bool m_overlayDisplaySuppressed = false;
   bool m_wasVisibleBeforeOverlaySuppress = false;

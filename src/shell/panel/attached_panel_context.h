@@ -2,7 +2,29 @@
 
 #include "render/core/render_styles.h"
 
+#include <cstdint>
 #include <string_view>
+
+enum class AttachedRevealDirection : std::uint8_t {
+  Down,
+  Up,
+  Right,
+  Left,
+};
+
+struct AttachedPanelGeometry {
+  float x = 0.0f;
+  float y = 0.0f;
+  float width = 0.0f;
+  float height = 0.0f;
+  // Full panel corner radius; used for the away-side convex corners, which are visible
+  // throughout the open/close animation and should always render rounded.
+  float cornerRadius = 0.0f;
+  // Bar-side concave-corner radius. Animated with the reveal progress: zero while the
+  // bg's bar-side edge is still hidden behind the bar, ramps to cornerRadius as the
+  // bulges slide into view near the end of the open animation.
+  float bulgeRadius = 0.0f;
+};
 
 namespace attached_panel {
 
@@ -56,6 +78,19 @@ namespace attached_panel {
         .right = radius,
         .bottom = 0.0f,
     };
+  }
+
+  [[nodiscard]] inline AttachedRevealDirection revealDirection(std::string_view barPosition) {
+    if (barPosition == "bottom") {
+      return AttachedRevealDirection::Up;
+    }
+    if (barPosition == "left") {
+      return AttachedRevealDirection::Right;
+    }
+    if (barPosition == "right") {
+      return AttachedRevealDirection::Left;
+    }
+    return AttachedRevealDirection::Down;
   }
 
   [[nodiscard]] inline Radii cornerRadii(std::string_view barPosition, float radius) {

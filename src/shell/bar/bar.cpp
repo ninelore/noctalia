@@ -1,6 +1,5 @@
 #include "shell/bar/bar.h"
 
-#include "compositors/compositor_detect.h"
 #include "compositors/compositor_platform.h"
 #include "config/config_service.h"
 #include "core/log.h"
@@ -32,24 +31,22 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cmath>
 #include <linux/input-event-codes.h>
 #include <optional>
 #include <ranges>
+#include <system_error>
 #include <unordered_set>
 #include <wayland-client-core.h>
 
 namespace {
 
-  // niri and Hyprland retain the previous buffer across a layer-surface resize; every other
-  // (wlroots-style) compositor blanks the surface for a frame on set_size. Where it blanks, we
-  // grow the bar surface to host a panel but never shrink it back — the shrink-on-close is the
-  // only resize the user can see (open's blank is masked by the reveal animation). Keeping the
-  // surface grown trades a fatter idle surface for a flicker-free close.
-  [[nodiscard]] bool barSurfaceResizeBlanks() { return !(compositors::isNiri() || compositors::isHyprland()); }
-
   constexpr std::int32_t kAutoHideTriggerPx = 3;
   constexpr float kAutoHideSlideExtraPx = 4.0f;
+  constexpr std::uint32_t kAttachedPanelResizeTestDefaultExtent = 360;
+  constexpr std::uint32_t kAttachedPanelResizeTestMaxExtent = 4096;
+  constexpr float kAttachedPanelResizeTestCycleHoldMs = 1800.0f;
 
   [[nodiscard]] FontWeight parseWidgetLabelFontWeight(const WidgetConfig& config, FontWeight fallback) {
     const auto it = config.settings.find("font_weight");
@@ -532,177 +529,28 @@ namespace {
     };
   }
 
-  // Surface-local rect for an attached-panel region centered on the bar main axis with the
-  // given main-axis length. The inner-axis span runs from the bar's VISIBLE inner edge to
-  // the surface edge minus shadow bleed (so the drop shadow has room past the body).
-  [[nodiscard]] std::optional<InputRect> attachedPanelRegionRect(
-      const BarConfig& cfg, const ShellConfig::ShadowConfig& shadow, int surfW, int surfH, int mainExtent,
-      int innerExtent
-  ) {
-    if (surfW <= 0 || surfH <= 0 || mainExtent <= 0 || innerExtent <= 0) {
+  [[nodiscard]] std::optional<InputRect>
+  attachedPanelResizeTestRect(const BarConfig& cfg, const ShellConfig::ShadowConfig& shadow, int surfW, int surfH) {
+    const auto base = computeBarSurfaceSpec(cfg, shadow);
+    if (surfW <= 0 || surfH <= 0) {
       return std::nullopt;
     }
-    // Anchor the panel region to the bar's VISIBLE inner edge (not the surface edge,
-    // which sits a shadow-bleed margin away) so the union tab is flush with the bar.
-    const float innerExt = barInnerSurfaceExtension(cfg, shadow, static_cast<float>(surfW), static_cast<float>(surfH));
-    const auto barVisual =
-        computeBarVisualGeometry(cfg, shadow, static_cast<float>(surfW), static_cast<float>(surfH), innerExt);
-    // The panel's depth along the inner axis is its OWN length, not the distance to the surface
-    // edge: on blank-prone compositors the surface stays grown to the largest panel ever opened
-    // (grow-only), so a smaller panel must honor its preferred size instead of filling the surface.
 
     if (cfg.position == "left" || cfg.position == "right") {
-      const int innerEdge = cfg.position == "right" ? static_cast<int>(std::lround(barVisual.x))
-                                                    : static_cast<int>(std::lround(barVisual.x + barVisual.width));
-      const int width = innerExtent;
-      const int x = cfg.position == "right" ? innerEdge - width : innerEdge;
-      const int mainLen = std::min(surfH, mainExtent);
-      const int mainPos = (surfH - mainLen) / 2;
-      return InputRect{x, mainPos, width, mainLen};
-    }
-
-    const int innerEdge = cfg.position == "bottom" ? static_cast<int>(std::lround(barVisual.y))
-                                                   : static_cast<int>(std::lround(barVisual.y + barVisual.height));
-    const int height = innerExtent;
-    const int y = cfg.position == "bottom" ? innerEdge - height : innerEdge;
-    const int mainLen = std::min(surfW, mainExtent);
-    const int mainPos = (surfW - mainLen) / 2;
-    return InputRect{mainPos, y, mainLen, height};
-  }
-
-  // Secondary "union" shape that fuses an attached panel region into the bar's bg/shadow
-  // silhouette in one pass, expressed in the bar node's local shape space (origin = node
-  // top-left). The away-side corners are convex (rounded), the bar-side corners concave
-  // (filleted into the bar); the body is extended by the radius on the cross axis so the
-  // logicalInset re-centers it, matching the attached-panel tab shape.
-  struct AttachedPanelUnion {
-    float offsetX = 0.0f;
-    float offsetY = 0.0f;
-    float width = 0.0f;
-    float height = 0.0f;
-    CornerShapes corners{};
-    RectInsets logicalInset{};
-    Radii radii{};
-  };
-
-  // Logical px the panel body overlaps INTO the bar along the inner axis. The union is one
-  // primitive, so where the bar and panel shapes merely abut, min(dBar,dPanel) == 0 along
-  // the shared line and AA renders it at 50% coverage — a hairline. Overlapping makes the
-  // seam strictly interior (distance < 0) so it is fully covered (single coverage, no double-alpha).
-  constexpr float kAttachedPanelUnionOverlap = 1.5f;
-
-  // `body{X,Y,W,H}` is the panel body in surface-local coordinates; its bar-side edge must
-  // be the bar's EXACT (unrounded) inner edge. The bar-side edge is then extended into the
-  // bar by the union overlap above.
-  [[nodiscard]] AttachedPanelUnion attachedPanelUnionShape(
-      std::string_view barPosition, float bodyX, float bodyY, float bodyW, float bodyH, float nodeOriginX,
-      float nodeOriginY, float radius
-  ) {
-    const bool vertical = (barPosition == "left" || barPosition == "right");
-
-    // Overlap the bar-side edge into the bar (watertight union seam).
-    const float ov = kAttachedPanelUnionOverlap;
-    if (barPosition == "bottom") {
-      bodyH += ov;
-    } else if (barPosition == "top") {
-      bodyY -= ov;
-      bodyH += ov;
-    } else if (barPosition == "right") {
-      bodyW += ov;
-    } else { // left
-      bodyX -= ov;
-      bodyW += ov;
-    }
-
-    const float crossHalf = (vertical ? bodyH : bodyW) * 0.5f;
-    const float inner = vertical ? bodyW : bodyH;
-    const float r = std::max(0.0f, std::min({radius, crossHalf, inner}));
-
-    AttachedPanelUnion u;
-    u.corners = attached_panel::cornerShapes(barPosition);
-    u.logicalInset = attached_panel::logicalInset(barPosition, r);
-    u.radii = Radii{r, r, r, r};
-    if (vertical) {
-      u.offsetX = bodyX - nodeOriginX;
-      u.offsetY = (bodyY - r) - nodeOriginY;
-      u.width = bodyW;
-      u.height = bodyH + 2.0f * r;
-    } else {
-      u.offsetX = (bodyX - r) - nodeOriginX;
-      u.offsetY = bodyY - nodeOriginY;
-      u.width = bodyW + 2.0f * r;
-      u.height = bodyH;
-    }
-    return u;
-  }
-
-  void applyUnionShape(RoundedRectStyle& style, const AttachedPanelUnion& u) {
-    style.unionShape = true;
-    style.unionOffsetX = u.offsetX;
-    style.unionOffsetY = u.offsetY;
-    style.unionWidth = u.width;
-    style.unionHeight = u.height;
-    style.unionCorners = u.corners;
-    style.unionLogicalInset = u.logicalInset;
-    style.unionRadius = u.radii;
-  }
-
-  // Union shape for an attached panel region at a given reveal progress (0 = hidden behind
-  // the bar, 1 = fully emerged). The bar-side edge stays fixed at the bar; the far edge
-  // moves outward by full_extent * progress so the tab grows out of the bar.
-  [[nodiscard]] std::optional<AttachedPanelUnion> computeAttachedPanelUnion(
-      const BarConfig& cfg, const ShellConfig::ShadowConfig& shadow, int surfW, int surfH, int mainExtent,
-      int innerExtent, float radius, float progress
-  ) {
-    const float p = std::clamp(progress, 0.0f, 1.0f);
-    if (p <= 0.0f) {
-      return std::nullopt;
-    }
-    const auto rect = attachedPanelRegionRect(cfg, shadow, surfW, surfH, mainExtent, innerExtent);
-    if (!rect.has_value()) {
-      return std::nullopt;
-    }
-    const float innerExt = barInnerSurfaceExtension(cfg, shadow, static_cast<float>(surfW), static_cast<float>(surfH));
-    const auto barVisual =
-        computeBarVisualGeometry(cfg, shadow, static_cast<float>(surfW), static_cast<float>(surfH), innerExt);
-    const auto concave = barConcaveShape(cfg);
-    const float nodeOriginX = barVisual.x - concave.logicalInset.left;
-    const float nodeOriginY = barVisual.y - concave.logicalInset.top;
-    const auto& pr = *rect;
-
-    float bodyX = 0.0f;
-    float bodyY = 0.0f;
-    float bodyW = 0.0f;
-    float bodyH = 0.0f;
-    if (cfg.position == "left" || cfg.position == "right") {
-      bodyY = static_cast<float>(pr.y);
-      bodyH = static_cast<float>(pr.height);
-      if (cfg.position == "right") {
-        const float barLeft = barVisual.x; // bar-side edge
-        bodyW = barLeft * p;
-        bodyX = barLeft - bodyW;
-      } else {
-        const float barRight = barVisual.x + barVisual.width; // bar-side edge
-        bodyX = barRight;
-        bodyW = (static_cast<float>(pr.x + pr.width) - barRight) * p;
+      const int baseW = static_cast<int>(base.surfaceWidth);
+      const int extraW = surfW - baseW;
+      if (extraW <= 0) {
+        return std::nullopt;
       }
-    } else {
-      bodyX = static_cast<float>(pr.x);
-      bodyW = static_cast<float>(pr.width);
-      if (cfg.position == "bottom") {
-        const float barTop = barVisual.y; // bar-side edge
-        bodyH = (barTop - static_cast<float>(pr.y)) * p;
-        bodyY = barTop - bodyH;
-      } else {
-        const float barBottom = barVisual.y + barVisual.height; // bar-side edge
-        bodyY = barBottom;
-        bodyH = (static_cast<float>(pr.y + pr.height) - barBottom) * p;
-      }
+      return InputRect{cfg.position == "right" ? 0 : baseW, 0, extraW, surfH};
     }
-    if (bodyW <= 0.0f || bodyH <= 0.0f) {
+
+    const int baseH = static_cast<int>(base.surfaceHeight);
+    const int extraH = surfH - baseH;
+    if (extraH <= 0) {
       return std::nullopt;
     }
-    return attachedPanelUnionShape(cfg.position, bodyX, bodyY, bodyW, bodyH, nodeOriginX, nodeOriginY, radius);
+    return InputRect{0, cfg.position == "bottom" ? 0 : baseH, surfW, extraH};
   }
 
   std::pair<float, float> computeAutoHideHiddenDelta(
@@ -723,8 +571,7 @@ namespace {
   }
 
   void applyBarShadowStyle(
-      BarInstance& instance, const ShellConfig::ShadowConfig& shadowConfig, float surfaceWidth, float surfaceHeight,
-      const std::optional<AttachedPanelUnion>& panelUnion = std::nullopt
+      BarInstance& instance, const ShellConfig::ShadowConfig& shadowConfig, float surfaceWidth, float surfaceHeight
   ) {
     if (instance.shadow == nullptr) {
       return;
@@ -750,8 +597,27 @@ namespace {
         }
     );
 
-    if (panelUnion.has_value()) {
-      applyUnionShape(shadowStyle, *panelUnion);
+    const bool panelShadowExclusion = instance.attachedPanelGeometry.has_value()
+        && instance.attachedPanelGeometry->width > 0.0f
+        && instance.attachedPanelGeometry->height > 0.0f;
+    if (panelShadowExclusion) {
+      const auto& attached = *instance.attachedPanelGeometry;
+      const float convexRadius = std::max(0.0f, attached.cornerRadius);
+      const float bulgeRadius = std::max(0.0f, attached.bulgeRadius);
+      const std::string_view barPosition = instance.barConfig.position;
+      const auto corners = attached_panel::cornerShapes(barPosition);
+      const auto pickRadius = [&](CornerShape shape) {
+        return shape == CornerShape::Concave ? bulgeRadius : convexRadius;
+      };
+      shadowStyle.shadowExclusion = true;
+      shadowStyle.shadowExclusionOffsetX = shadowX - attached.x;
+      shadowStyle.shadowExclusionOffsetY = shadowY - attached.y;
+      shadowStyle.shadowExclusionWidth = attached.width;
+      shadowStyle.shadowExclusionHeight = attached.height;
+      shadowStyle.shadowExclusionCorners = corners;
+      shadowStyle.shadowExclusionLogicalInset = attached_panel::logicalInset(barPosition, bulgeRadius);
+      shadowStyle.shadowExclusionRadius =
+          Radii{pickRadius(corners.tl), pickRadius(corners.tr), pickRadius(corners.br), pickRadius(corners.bl)};
     }
 
     auto configureShadow = [&](Box* node, float x, float y) {
@@ -1254,102 +1120,6 @@ void Bar::setAutoHideSuppressionCallback(std::function<bool(const BarInstance&)>
   m_autoHideSuppressionCallback = std::move(callback);
 }
 
-void Bar::setHostedPanelReadyCallback(std::function<void(wl_output*, std::string_view)> callback) {
-  m_hostedPanelReadyCallback = std::move(callback);
-}
-
-void Bar::setHostedPanelFrameTickCallback(std::function<void(float)> callback) {
-  m_hostedPanelFrameTickCallback = std::move(callback);
-}
-
-void Bar::requestHostedPanelLayout(wl_output* output, std::string_view barName) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->surface == nullptr) {
-    return;
-  }
-  instance->surface->requestLayout();
-}
-
-void Bar::requestHostedPanelRedraw(wl_output* output, std::string_view barName) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->surface == nullptr) {
-    return;
-  }
-  instance->surface->requestRedraw();
-}
-
-void Bar::requestHostedPanelFrameTick(wl_output* output, std::string_view barName) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->surface == nullptr) {
-    return;
-  }
-  instance->surface->requestFrameTick();
-}
-
-void Bar::setHostedPanelFocus(wl_output* output, std::string_view barName, InputArea* area) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen) {
-    return;
-  }
-  instance->inputDispatcher.setFocus(area);
-}
-
-void Bar::setHostedPanelPopupContext(wl_output* output, std::string_view barName, SelectPopupContext* context) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->hostedPanelContent == nullptr) {
-    return;
-  }
-  instance->hostedPanelContent->setPopupContext(context);
-}
-
-void Bar::dispatchHostedPanelKey(
-    wl_output* output, std::string_view barName, std::uint32_t sym, std::uint32_t utf32, std::uint32_t modifiers,
-    bool pressed, bool preedit
-) {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->surface == nullptr) {
-    return;
-  }
-  instance->inputDispatcher.keyEvent(sym, utf32, modifiers, pressed, preedit);
-  if (instance->sceneRoot != nullptr && (instance->sceneRoot->paintDirty() || instance->sceneRoot->layoutDirty())) {
-    if (instance->sceneRoot->layoutDirty()) {
-      instance->surface->requestLayout();
-    } else {
-      instance->surface->requestRedraw();
-    }
-  }
-}
-
-AnimationManager* Bar::hostedPanelAnimationManager(wl_output* output, std::string_view barName) const {
-  BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr) {
-    return nullptr;
-  }
-  return &instance->animations;
-}
-
-std::optional<LayerPopupParentContext>
-Bar::hostedPanelPopupParentContext(wl_output* output, std::string_view barName) const {
-  const BarInstance* instance = instanceForBar(output, barName);
-  if (instance == nullptr || !instance->hostedPanelOpen || instance->surface == nullptr) {
-    return std::nullopt;
-  }
-  const std::uint32_t width = instance->surface->width();
-  const std::uint32_t height = instance->surface->height();
-  zwlr_layer_surface_v1* layerSurface = instance->surface->layerSurface();
-  wl_surface* wlSurface = instance->surface->wlSurface();
-  if (layerSurface == nullptr || wlSurface == nullptr || width == 0 || height == 0) {
-    return std::nullopt;
-  }
-  LayerPopupParentContext context;
-  context.surface = wlSurface;
-  context.layerSurface = layerSurface;
-  context.output = instance->output;
-  context.width = width;
-  context.height = height;
-  return context;
-}
-
 void Bar::reevaluateAutoHide() {
   for (const auto& instance : m_instances) {
     if (instance == nullptr
@@ -1559,26 +1329,8 @@ std::vector<InputRect> Bar::surfaceRectsForOutput(wl_output* output) const {
       rectY = mTop;
     }
 
-    if (instance->hostedPanelOpen) {
-      // Exclude only the visible bar strip and the panel tab, not the full-width grown
-      // surface, so clicks beside the panel (empty grown area) still dismiss the panel.
-      // (rectX, rectY) is the surface origin in output-local coordinates.
-      const auto& shadowCfg = m_config->config().shell.shadow;
-      const auto barRegion = barContentInputRegion(instance->barConfig, shadowCfg, surfW, surfH);
-      rects.push_back(InputRect{rectX + barRegion.x, rectY + barRegion.y, barRegion.width, barRegion.height});
-      if (auto panel = attachedPanelRegionRect(
-              instance->barConfig, shadowCfg, surfW, surfH, static_cast<int>(std::lround(instance->hostedPanelMainLen)),
-              static_cast<int>(std::lround(instance->hostedPanelInnerLen))
-          );
-          panel.has_value()) {
-        rects.push_back(InputRect{rectX + panel->x, rectY + panel->y, panel->width, panel->height});
-      }
-    } else if (rectW > 0 && rectH > 0) {
-      // Exclude the visible bar strip, not the whole surface: on blank-prone compositors the surface
-      // can stay grown after a hosted panel closes (grow-only), so the full-surface rect would
-      // over-cover the transparent grown area and swallow dismiss clicks there.
-      const auto barRegion = barContentInputRegion(instance->barConfig, m_config->config().shell.shadow, surfW, surfH);
-      rects.push_back(InputRect{rectX + barRegion.x, rectY + barRegion.y, barRegion.width, barRegion.height});
+    if (rectW > 0 && rectH > 0) {
+      rects.push_back(InputRect{rectX, rectY, rectW, rectH});
     }
   }
 
@@ -1606,10 +1358,37 @@ bool Bar::canAttachPanelToBar(wl_output* output, std::string_view barName) const
   return instance->barConfig.autoHide || instanceEffectivelyVisible(*instance);
 }
 
+bool Bar::isAttachedPanelBarSettled(wl_output* output, std::string_view barName) const noexcept {
+  const BarInstance* instance = instanceForBar(output, barName);
+  if (instance == nullptr || !instance->barConfig.autoHide) {
+    return true;
+  }
+  constexpr float kSettledThreshold = 0.999f;
+  return instance->hideOpacity >= kSettledThreshold;
+}
+
 void Bar::revealAutoHideForAttachedPanel(wl_output* output, std::string_view barName) {
   BarInstance* instance = instanceForBar(output, barName);
   if (instance != nullptr) {
     revealAutoHideBar(*instance);
+  }
+}
+
+void Bar::setAttachedPanelGeometry(
+    wl_output* output, std::string_view barName, std::optional<AttachedPanelGeometry> geometry
+) {
+  BarInstance* instance = instanceForBar(output, barName);
+  if (instance == nullptr) {
+    return;
+  }
+
+  instance->attachedPanelGeometry = geometry;
+  if (instance->surface != nullptr && instance->surface->width() > 0 && instance->surface->height() > 0) {
+    applyBarShadowStyle(
+        *instance, m_config->config().shell.shadow, static_cast<float>(instance->surface->width()),
+        static_cast<float>(instance->surface->height())
+    );
+    instance->surface->requestRedraw();
   }
 }
 
@@ -1783,13 +1562,10 @@ void Bar::createInstance(const WaylandOutput& output, std::size_t barIndex, cons
   instance->surface->setPrepareFrameCallback([this, inst](bool needsUpdate, bool needsLayout) {
     prepareFrame(*inst, needsUpdate, needsLayout);
   });
-  instance->surface->setFrameTickCallback([this, inst](float deltaMs) {
+  instance->surface->setFrameTickCallback([inst](float deltaMs) {
     tickWidgets(inst->startWidgets, deltaMs);
     tickWidgets(inst->centerWidgets, deltaMs);
     tickWidgets(inst->endWidgets, deltaMs);
-    if (inst->hostedPanelOpen && m_hostedPanelFrameTickCallback) {
-      m_hostedPanelFrameTickCallback(deltaMs);
-    }
   });
 
   instance->surface->setAnimationManager(&instance->animations);
@@ -2216,15 +1992,11 @@ void Bar::syncBarAutoHideInputRegion(BarInstance& instance) const {
     instance.surface->setInputRegion({});
     return;
   }
-  if (instance.hostedPanelOpen) {
-    const int mainExtent = static_cast<int>(std::lround(instance.hostedPanelMainLen));
-    const int innerExtent = static_cast<int>(std::lround(instance.hostedPanelInnerLen));
+  if (instance.attachedPanelResizeTestOpen) {
     std::vector<InputRect> regions{
         barContentInputRegion(instance.barConfig, m_config->config().shell.shadow, surfW, surfH)
     };
-    if (auto panelRect = attachedPanelRegionRect(
-            instance.barConfig, m_config->config().shell.shadow, surfW, surfH, mainExtent, innerExtent
-        );
+    if (auto panelRect = attachedPanelResizeTestRect(instance.barConfig, m_config->config().shell.shadow, surfW, surfH);
         panelRect.has_value()) {
       regions.push_back(*panelRect);
     }
@@ -2252,6 +2024,11 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
   instance.ipcLayoutReleased = false;
   instance.animations.cancelForOwner(instance.slideRoot);
   const float current = instance.hideOpacity;
+  wl_output* output = instance.output;
+  const std::string barName = instance.barConfig.name;
+  const auto notifyAttachedPanel = [output, barName]() {
+    PanelManager::instance().onAttachedBarRevealSettled(output, barName);
+  };
 
   constexpr float kSettledThreshold = 0.999f;
   if (current >= kSettledThreshold) {
@@ -2260,6 +2037,7 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
     instance.surface->setInputRegion(barAutoHideSurfaceInputRegion(instance.barConfig, surfW, surfH, true));
     syncBarSurfaceChrome(instance);
     instance.surface->requestRedraw();
+    notifyAttachedPanel();
     return;
   }
 
@@ -2270,7 +2048,7 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
         syncBarSlideLayerTransform(*inst);
         syncBarSurfaceChrome(*inst);
       },
-      {}, instance.slideRoot
+      notifyAttachedPanel, instance.slideRoot
   );
   const int surfW = static_cast<int>(instance.surface->width());
   const int surfH = static_cast<int>(instance.surface->height());
@@ -2322,48 +2100,6 @@ void Bar::applyBarCompositorBlur(BarInstance& instance) const {
       px + insetL, py + insetT, pw - insetL - insetR, ph - insetT - insetB, concave.corners, concave.logicalInset,
       concave.radii
   );
-
-  // Hosted attached panel: extend the blur to the revealed panel body so bar∪panel blur as one
-  // region. The revealed rect matches the bg-union body (positionHostedPanelContent's clip window).
-  if (instance.hostedPanelOpen && m_config != nullptr) {
-    const auto& shadowConfig = m_config->config().shell.shadow;
-    const int surfW = static_cast<int>(instance.surface->width());
-    const int surfH = static_cast<int>(instance.surface->height());
-    const auto region = attachedPanelRegionRect(
-        instance.barConfig, shadowConfig, surfW, surfH, static_cast<int>(std::lround(instance.hostedPanelMainLen)),
-        static_cast<int>(std::lround(instance.hostedPanelInnerLen))
-    );
-    const float p = std::clamp(instance.hostedPanelProgress, 0.0f, 1.0f);
-    if (region.has_value() && p > 0.001f) {
-      const auto& r = *region;
-      const std::string& pos = instance.barConfig.position;
-      const bool isVertical = (pos == "left" || pos == "right");
-      const float revealed = static_cast<float>(isVertical ? r.width : r.height) * p;
-      float bx = static_cast<float>(r.x);
-      float by = static_cast<float>(r.y);
-      float bw = static_cast<float>(r.width);
-      float bh = static_cast<float>(r.height);
-      if (pos == "top") {
-        bh = revealed;
-      } else if (pos == "bottom") {
-        by = static_cast<float>(r.y + r.height) - revealed;
-        bh = revealed;
-      } else if (pos == "left") {
-        bw = revealed;
-      } else {
-        bx = static_cast<float>(r.x + r.width) - revealed;
-        bw = revealed;
-      }
-      const float radius = instance.hostedPanelRadius;
-      auto panelStrips = Surface::tessellateShape(
-          static_cast<int>(std::lround(bx)), static_cast<int>(std::lround(by)), static_cast<int>(std::lround(bw)),
-          static_cast<int>(std::lround(bh)), attached_panel::cornerShapes(pos),
-          attached_panel::logicalInset(pos, radius), attached_panel::cornerRadii(pos, radius)
-      );
-      blurStrips.insert(blurStrips.end(), panelStrips.begin(), panelStrips.end());
-    }
-  }
-
   instance.surface->setBlurRegion(blurStrips);
 }
 
@@ -2399,11 +2135,6 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
   uiAssertNotRendering("Bar::buildScene");
   if (m_renderContext == nullptr) {
     return;
-  }
-  // Layout measures text, which needs the GL context current and content scale synced.
-  // Configure-driven and ad-hoc builds may run with another (or no) surface current.
-  if (instance.surface != nullptr) {
-    m_renderContext->makeCurrent(instance.surface->renderTarget());
   }
   auto* renderer = m_renderContext;
 
@@ -2464,6 +2195,26 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     }
     // Note: shadow is inserted before bar sections so it renders below them (z=-1 is set below).
 
+    instance.attachedPanelResizeTestRect = static_cast<Box*>(instance.slideRoot->addChild(
+        ui::box({
+            .visible = false,
+            .participatesInLayout = false,
+            .configure = [](Box& panel) {
+              panel.setHitTestVisible(false);
+              panel.setStyle(
+                  RoundedRectStyle{
+                      .fill = rgba(0.10f, 0.68f, 1.0f, 0.72f),
+                      .border = rgba(1.0f, 1.0f, 1.0f, 0.92f),
+                      .fillMode = FillMode::Solid,
+                      .radius = 0.0f,
+                      .softness = 0.0f,
+                      .borderWidth = 2.0f,
+                  }
+              );
+            },
+        })
+    ));
+
     auto contentClip = std::make_unique<Node>();
     contentClip->setClipChildren(true);
     instance.contentClip = instance.slideRoot->addChild(std::move(contentClip));
@@ -2520,23 +2271,11 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     instance.slideRoot->setSize(w, h);
   }
 
-  // Hosted attached panel: fuse the panel region into the bar bg/shadow as a single union-SDF
-  // silhouette (one fill, one shadow, no seam), tracking the current reveal progress.
-  std::optional<AttachedPanelUnion> panelUnion;
-  if (instance.hostedPanelOpen) {
-    panelUnion = computeAttachedPanelUnion(
-        instance.barConfig, shadowConfig, static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h)),
-        static_cast<int>(std::lround(instance.hostedPanelMainLen)),
-        static_cast<int>(std::lround(instance.hostedPanelInnerLen)), instance.hostedPanelRadius,
-        instance.hostedPanelProgress
-    );
-  }
-
   // Background covers only the bar visual area (not the shadow extension).
   // Keep it exactly aligned with the shadow shape; the shadow shader now
   // draws only outside the rect, so any size mismatch is visible at corners.
   if (instance.bg != nullptr) {
-    RoundedRectStyle bgStyle{
+    const RoundedRectStyle bgStyle{
         .fill = colorForRole(ColorRole::Surface, instance.barConfig.backgroundOpacity),
         .border = resolveColorSpec(instance.barConfig.border),
         .fillMode = FillMode::Solid,
@@ -2546,9 +2285,6 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
         .softness = 0.0f,
         .borderWidth = instance.barConfig.borderWidth,
     };
-    if (panelUnion.has_value()) {
-      applyUnionShape(bgStyle, *panelUnion);
-    }
     instance.bg->setStyle(bgStyle);
     // (barAreaX/Y/W/H) is the body; the shader expands outward by logicalInset into
     // the visual rect, so the node must be sized to the visual rect.
@@ -2570,12 +2306,20 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     instance.contentClip->setSize(barAreaW, barAreaH);
   }
 
-  applyBarShadowStyle(instance, shadowConfig, w, h, panelUnion);
+  applyBarShadowStyle(instance, shadowConfig, w, h);
+
+  if (instance.attachedPanelResizeTestRect != nullptr) {
+    const auto rect = attachedPanelResizeTestRect(
+        instance.barConfig, shadowConfig, static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h))
+    );
+    instance.attachedPanelResizeTestRect->setVisible(instance.attachedPanelResizeTestOpen && rect.has_value());
+    if (rect.has_value()) {
+      instance.attachedPanelResizeTestRect->setPosition(static_cast<float>(rect->x), static_cast<float>(rect->y));
+      instance.attachedPanelResizeTestRect->setSize(static_cast<float>(rect->width), static_cast<float>(rect->height));
+    }
+  }
 
   layoutBarSections(instance, *renderer, barAreaW, barAreaH, padding, isVertical);
-
-  // Lay out and position bar-hosted attached panel content at the current reveal progress.
-  layoutHostedPanelContent(instance, *renderer, w, h);
 
   if (instance.barConfig.autoHide) {
     float contentLeft = barAreaX;
@@ -2651,20 +2395,8 @@ void Bar::prepareFrame(BarInstance& instance, bool needsUpdate, bool needsLayout
   m_renderContext->makeCurrent(instance.surface->renderTarget());
 
   if (needsUpdate) {
-    {
-      UiPhaseScope updatePhase(UiPhase::Update);
-      updateWidgets(instance);
-    }
-    // A hosted attached panel syncs its data inside its layout pass, so an update-only refresh
-    // (e.g. Bar::refresh reacting to a service change) must still reflow it — otherwise it shows
-    // stale state until an unrelated relayout. Detached panels avoid this by owning a separate
-    // surface, so their refresh never collides with the bar's update flag.
-    if (instance.hostedPanelOpen) {
-      layoutHostedPanelContent(
-          instance, *m_renderContext, static_cast<float>(instance.surface->width()),
-          static_cast<float>(instance.surface->height())
-      );
-    }
+    UiPhaseScope updatePhase(UiPhase::Update);
+    updateWidgets(instance);
     return;
   }
 
@@ -2695,10 +2427,6 @@ void Bar::prepareFrame(BarInstance& instance, bool needsUpdate, bool needsLayout
     }
     layoutBarSections(instance, *m_renderContext, barAreaW, barAreaH, padding, isVertical);
   }
-
-  // Re-run the hosted attached panel's content layout so internal relayouts (tab switches,
-  // expanding sections) reflow without a surface resize. The Panel manages its own phase scopes.
-  layoutHostedPanelContent(instance, *m_renderContext, w, h);
 }
 
 bool Bar::onPointerEvent(const PointerEvent& event) {
@@ -3079,6 +2807,17 @@ namespace {
     return std::nullopt;
   }
 
+  [[nodiscard]] std::optional<std::uint32_t> parseAttachedPanelResizeTestSize(std::string_view value) {
+    std::uint32_t parsed = 0;
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc{} || ptr != end || parsed == 0 || parsed > kAttachedPanelResizeTestMaxExtent) {
+      return std::nullopt;
+    }
+    return parsed;
+  }
+
 } // namespace
 
 std::string Bar::showBarIpc(std::string_view args) {
@@ -3272,341 +3011,160 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
   return "ok\n";
 }
 
-void Bar::layoutHostedPanelContent(BarInstance& instance, Renderer& renderer, float w, float h) {
-  if (!instance.hostedPanelOpen || instance.hostedPanelContent == nullptr || m_config == nullptr) {
-    return;
+std::uint32_t Bar::attachedPanelResizeTestMaxExtent(const BarInstance& instance) const {
+  if (m_config == nullptr) {
+    return 0;
   }
-  const auto& shadowConfig = m_config->config().shell.shadow;
-  const auto region = attachedPanelRegionRect(
-      instance.barConfig, shadowConfig, static_cast<int>(std::lround(w)), static_cast<int>(std::lround(h)),
-      static_cast<int>(std::lround(instance.hostedPanelMainLen)),
-      static_cast<int>(std::lround(instance.hostedPanelInnerLen))
-  );
-  if (region.has_value() && instance.hostedPanelLayout) {
-    const float inset = instance.hostedPanelInset;
-    instance.hostedPanelLayout(
-        renderer, std::max(0.0f, static_cast<float>(region->width) - inset * 2.0f),
-        std::max(0.0f, static_cast<float>(region->height) - inset * 2.0f)
-    );
-  }
-  positionHostedPanelContent(instance, instance.hostedPanelProgress);
-  // The surface grow is async: re-sync the input region now that layout runs at the grown
-  // size so the panel area is clickable. Once grown, tell PanelManager to (re)arm dismissal
-  // so the click shield excludes the grown bar surface.
-  if (region.has_value()) {
-    syncBarAutoHideInputRegion(instance);
-    if (!instance.hostedPanelReadyFired && m_hostedPanelReadyCallback) {
-      instance.hostedPanelReadyFired = true;
-      m_hostedPanelReadyCallback(instance.output, instance.barConfig.name);
+
+  const auto base = computeBarSurfaceSpec(instance.barConfig, m_config->config().shell.shadow);
+  const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
+  const std::uint32_t baseAxis = isVertical ? base.surfaceWidth : base.surfaceHeight;
+  std::uint32_t outputAxis = 0;
+  if (m_platform != nullptr) {
+    const auto& outputs = m_platform->outputs();
+    const auto it = std::ranges::find_if(outputs, [&instance](const WaylandOutput& output) {
+      return output.output == instance.output;
+    });
+    if (it != outputs.end()) {
+      const auto logicalAxis = isVertical ? it->logicalWidth : it->logicalHeight;
+      if (logicalAxis > 0) {
+        outputAxis = static_cast<std::uint32_t>(logicalAxis);
+      }
     }
   }
+  if (outputAxis <= baseAxis) {
+    return kAttachedPanelResizeTestMaxExtent;
+  }
+  return std::min(kAttachedPanelResizeTestMaxExtent, outputAxis - baseAxis);
 }
 
-void Bar::positionHostedPanelContent(BarInstance& instance, float progress) {
-  if (instance.hostedPanelClip == nullptr
-      || instance.hostedPanelContent == nullptr
-      || instance.surface == nullptr
-      || m_config == nullptr) {
-    return;
-  }
-  const auto& shadowConfig = m_config->config().shell.shadow;
-  const int surfW = static_cast<int>(instance.surface->width());
-  const int surfH = static_cast<int>(instance.surface->height());
-  const auto region = attachedPanelRegionRect(
-      instance.barConfig, shadowConfig, surfW, surfH, static_cast<int>(std::lround(instance.hostedPanelMainLen)),
-      static_cast<int>(std::lround(instance.hostedPanelInnerLen))
-  );
-  if (!region.has_value()) {
-    instance.hostedPanelClip->setVisible(false);
-    return;
-  }
-  const auto& r = *region;
-  const float p = std::clamp(progress, 0.0f, 1.0f);
-  instance.hostedPanelClip->setVisible(p > 0.0f);
-
-  const std::string& pos = instance.barConfig.position;
-  const bool isVertical = (pos == "left" || pos == "right");
-  const float full = static_cast<float>(isVertical ? r.width : r.height);
-  const float revealed = full * p;
-
-  // Revealed tab window (clip), bar-side edge fixed; the content sits at the full region
-  // and is wiped in as the clip grows out of the bar.
-  float clipX = static_cast<float>(r.x);
-  float clipY = static_cast<float>(r.y);
-  float clipW = static_cast<float>(r.width);
-  float clipH = static_cast<float>(r.height);
-  if (pos == "top") {
-    clipH = revealed;
-  } else if (pos == "bottom") {
-    clipY = static_cast<float>(r.y + r.height) - revealed;
-    clipH = revealed;
-  } else if (pos == "left") {
-    clipW = revealed;
-  } else { // right
-    clipX = static_cast<float>(r.x + r.width) - revealed;
-    clipW = revealed;
-  }
-  instance.hostedPanelClip->setPosition(clipX, clipY);
-  instance.hostedPanelClip->setSize(clipW, clipH);
-  instance.hostedPanelClip->setFrameSize(clipW, clipH);
-  // Content sits inset by the panel padding inside the tab; positioned relative to the clip.
-  const float inset = instance.hostedPanelInset;
-  instance.hostedPanelContent->setPosition(
-      (static_cast<float>(r.x) + inset) - clipX, (static_cast<float>(r.y) + inset) - clipY
-  );
-  instance.hostedPanelContent->setSize(
-      std::max(0.0f, static_cast<float>(r.width) - inset * 2.0f),
-      std::max(0.0f, static_cast<float>(r.height) - inset * 2.0f)
-  );
-}
-
-void Bar::applyHostedPanelReveal(BarInstance& instance, float progress) {
+void Bar::setAttachedPanelResizeTestOpen(BarInstance& instance, bool open, std::uint32_t extent) {
   if (m_config == nullptr || instance.surface == nullptr) {
     return;
   }
-  const auto& shadowConfig = m_config->config().shell.shadow;
-  const int surfW = static_cast<int>(instance.surface->width());
-  const int surfH = static_cast<int>(instance.surface->height());
-  const auto unionShape = computeAttachedPanelUnion(
-      instance.barConfig, shadowConfig, surfW, surfH, static_cast<int>(std::lround(instance.hostedPanelMainLen)),
-      static_cast<int>(std::lround(instance.hostedPanelInnerLen)), instance.hostedPanelRadius, progress
-  );
-  if (instance.bg != nullptr) {
-    auto bgStyle = instance.bg->style();
-    bgStyle.unionShape = false;
-    if (unionShape.has_value()) {
-      applyUnionShape(bgStyle, *unionShape);
+
+  instance.animations.cancelForOwner(&instance.attachedPanelResizeTestOpen);
+  instance.attachedPanelResizeTestOpen = open;
+  instance.attachedPanelResizeTestExtent = open ? extent : 0;
+
+  const auto base = computeBarSurfaceSpec(instance.barConfig, m_config->config().shell.shadow);
+  const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
+  std::uint32_t targetWidth = base.surfaceWidth;
+  std::uint32_t targetHeight = base.surfaceHeight;
+  if (open) {
+    if (isVertical) {
+      targetWidth += extent;
+    } else {
+      targetHeight += extent;
     }
-    instance.bg->setStyle(bgStyle);
   }
-  applyBarShadowStyle(instance, shadowConfig, static_cast<float>(surfW), static_cast<float>(surfH), unionShape);
-  positionHostedPanelContent(instance, progress);
-  applyBarCompositorBlur(instance); // track the revealed panel body in the blur region
+
+  instance.surface->requestSize(targetWidth, targetHeight);
+  syncBarAutoHideInputRegion(instance);
+  syncBarSurfaceChrome(instance);
+  instance.surface->requestLayout();
   instance.surface->requestRedraw();
 }
 
-wl_surface* Bar::openHostedAttachedPanel(
-    wl_output* output, std::string_view barName, std::unique_ptr<Node> content, float contentMainLen,
-    float contentInnerLen, float radius, float contentInset, std::function<void(Renderer&, float, float)> layout,
-    std::function<void()> closed
-) {
-  uiAssertNotRendering("Bar::openHostedAttachedPanel");
+std::string Bar::attachedPanelResizeTestIpc(std::string_view args) {
   if (m_config == nullptr) {
-    return nullptr;
-  }
-  BarInstance* inst = instanceForBar(output, barName);
-  if (inst == nullptr || inst->surface == nullptr || inst->slideRoot == nullptr) {
-    return nullptr;
+    return "error: config service not initialized\n";
   }
 
-  inst->animations.cancelForOwner(&inst->hostedPanelOpen);
-  // Tear down any previously hosted panel immediately (preempt).
-  if (inst->hostedPanelClip != nullptr && inst->slideRoot != nullptr) {
-    inst->slideRoot->removeChild(inst->hostedPanelClip);
-  }
-  inst->hostedPanelClip = nullptr;
-  inst->hostedPanelContent = nullptr;
-  inst->hostedPanelOpen = true;
-  inst->hostedPanelProgress = 0.0f;
-  inst->hostedPanelMainLen = contentMainLen;
-  inst->hostedPanelInnerLen = contentInnerLen;
-  inst->hostedPanelRadius = radius;
-  inst->hostedPanelInset = contentInset;
-  inst->hostedPanelReadyFired = false;
-  inst->hostedPanelLayout = std::move(layout);
-  inst->hostedPanelClosed = std::move(closed);
-
-  // Host subtree under slideRoot (sibling of contentClip): clip → content → panel root.
-  auto clip = std::make_unique<Node>();
-  clip->setClipChildren(true);
-  inst->hostedPanelClip = inst->slideRoot->addChild(std::move(clip));
-  auto contentNode = std::make_unique<Node>();
-  inst->hostedPanelContent = inst->hostedPanelClip->addChild(std::move(contentNode));
-  if (content != nullptr) {
-    content->setAnimationManager(&inst->animations);
-    inst->hostedPanelContent->addChild(std::move(content));
+  auto parts = StringUtils::splitWhitespace(StringUtils::trim(args));
+  if (parts.empty()) {
+    return "error: usage: bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]\n";
   }
 
-  // Route keyboard + IME to the hosted content via the bar's input dispatcher (its focus areas /
-  // text inputs now live in the bar's scene graph).
-  if (m_platform != nullptr) {
-    inst->inputDispatcher.setTextInputContext(inst->surface->wlSurface(), m_platform->wayland().textInputService());
-  }
-
-  // Grow the surface on the inner axis to fit the panel body + shadow bleed past it.
-  const auto& shadowConfig = m_config->config().shell.shadow;
-  const auto base = computeBarSurfaceSpec(inst->barConfig, shadowConfig);
-  const auto bleed = shell::surface_shadow::bleed(inst->barConfig.shadow, shadowConfig);
-  const std::string& pos = inst->barConfig.position;
-  const bool isVertical = (pos == "left" || pos == "right");
-  const float baseAxis = static_cast<float>(isVertical ? base.surfaceWidth : base.surfaceHeight);
-  const float baseW = static_cast<float>(base.surfaceWidth);
-  const float baseH = static_cast<float>(base.surfaceHeight);
-  const float innerExtBase = barInnerSurfaceExtension(inst->barConfig, shadowConfig, baseW, baseH);
-  const auto bv = computeBarVisualGeometry(inst->barConfig, shadowConfig, baseW, baseH, innerExtBase);
-  float targetAxis = baseAxis;
-  if (pos == "top") {
-    targetAxis = (bv.y + bv.height) + contentInnerLen + static_cast<float>(bleed.down);
-  } else if (pos == "bottom") {
-    targetAxis = contentInnerLen + static_cast<float>(bleed.up) + (baseAxis - bv.y);
-  } else if (pos == "left") {
-    targetAxis = (bv.x + bv.width) + contentInnerLen + static_cast<float>(bleed.right);
-  } else { // right
-    targetAxis = contentInnerLen + static_cast<float>(bleed.left) + (baseAxis - bv.x);
-  }
-  std::uint32_t targetW = base.surfaceWidth;
-  std::uint32_t targetH = base.surfaceHeight;
-  if (isVertical) {
-    targetW = static_cast<std::uint32_t>(std::ceil(targetAxis));
-  } else {
-    targetH = static_cast<std::uint32_t>(std::ceil(targetAxis));
-  }
-  // On blank-prone compositors the surface never shrinks (see barSurfaceResizeBlanks): reopening a
-  // panel smaller than the current grown size must not trigger a shrink-resize and its blank frame.
-  if (barSurfaceResizeBlanks()) {
-    targetW = std::max(targetW, inst->surface->width());
-    targetH = std::max(targetH, inst->surface->height());
-  }
-  inst->surface->requestSize(targetW, targetH);
-  // Grab keyboard while hosting so Escape (and later, full nav) works without first clicking
-  // into the panel, and so the Hyprland focus grab can capture outside clicks.
-  inst->surface->setKeyboardInteractivity(LayerShellKeyboard::Exclusive);
-  armHostedPanelKeyboardRelax(*inst);
-  syncBarAutoHideInputRegion(*inst);
-  syncBarSurfaceChrome(*inst);
-  inst->surface->requestLayout();
-
-  inst->animations.animate(
-      0.0f, 1.0f, Style::animSlow, Easing::EaseOutCubic,
-      [this, inst](float v) {
-        inst->hostedPanelProgress = v;
-        applyHostedPanelReveal(*inst, v);
-      },
-      {}, &inst->hostedPanelOpen
-  );
-  inst->surface->requestRedraw();
-  return inst->surface->wlSurface();
-}
-
-void Bar::armHostedPanelKeyboardRelax(BarInstance& instance) {
-  if (instance.surface == nullptr || m_platform == nullptr) {
-    return;
-  }
-  auto* grabService = m_platform->focusGrabService();
-  if (grabService == nullptr || !grabService->available()) {
-    return; // no focus grab (not hyprland): keep Exclusive so the bar surface holds keyboard focus itself
-  }
-  // Mirror the detached attached-panel recipe: Exclusive grabs focus for the freshly-hosting bar
-  // surface, then relax to OnDemand so the focus grab owns focus management from here.
-  BarInstance* inst = &instance;
-  inst->animations.animateTimer(
-      0.0f, 1.0f, 100.0f, Easing::Linear, [](float) {},
-      [inst]() {
-        if (inst->hostedPanelOpen && inst->surface != nullptr) {
-          inst->surface->setKeyboardInteractivity(LayerShellKeyboard::OnDemand);
-        }
-      },
-      &inst->hostedPanelOpen
-  );
-}
-
-void Bar::tearDownHostedPanel(BarInstance& instance, bool invokeClosed) {
-  if (!instance.hostedPanelOpen && instance.hostedPanelClip == nullptr) {
-    return; // already torn down
-  }
-  instance.animations.cancelForOwner(&instance.hostedPanelOpen);
-  instance.hostedPanelOpen = false;
-  instance.hostedPanelProgress = 0.0f;
-  applyHostedPanelReveal(instance, 0.0f); // clear the union from bg/shadow
-  // Detach the hosted-content pointers (so a re-entrant teardown from the closed callback —
-  // destroyPanel -> m_destroyHostedPanelCallback — no-ops via the early-return above) but keep
-  // the content subtree ALIVE: the Panel's onClose() reads its own widgets (e.g. audio sliders),
-  // which live in this subtree. Destroy it only AFTER the callback runs.
-  Node* clip = instance.hostedPanelClip;
-  instance.hostedPanelClip = nullptr;
-  instance.hostedPanelContent = nullptr;
-  instance.hostedPanelLayout = nullptr;
-  auto closedCb = std::move(instance.hostedPanelClosed);
-  instance.hostedPanelClosed = nullptr;
-  if (instance.surface != nullptr && m_config != nullptr) {
-    const auto base = computeBarSurfaceSpec(instance.barConfig, m_config->config().shell.shadow);
-    instance.surface->setKeyboardInteractivity(LayerShellKeyboard::None);
-    // On blank-prone compositors keep the surface grown — the shrink here is the one resize whose
-    // blank frame the user sees on close. The bar stays edge-anchored within the grown surface and
-    // the freed space is reclaimed via the exclusive zone (independent of the buffer size), so the
-    // grown area just sits transparent and click-through. niri/Hyprland shrink as before.
-    if (!barSurfaceResizeBlanks()) {
-      instance.surface->requestSize(base.surfaceWidth, base.surfaceHeight);
+  std::uint32_t extent = kAttachedPanelResizeTestDefaultExtent;
+  bool explicitSize = false;
+  if (parts.back().starts_with("size=")) {
+    explicitSize = true;
+    const std::string_view rawSize(parts.back().data() + 5, parts.back().size() - 5);
+    const auto parsed = parseAttachedPanelResizeTestSize(rawSize);
+    if (!parsed.has_value()) {
+      return "error: size must be an integer from 1 to 4096 pixels\n";
     }
-    syncBarAutoHideInputRegion(instance);
-    syncBarSurfaceChrome(instance);
-    instance.surface->requestLayout();
-    instance.surface->requestRedraw();
+    extent = *parsed;
+    parts.pop_back();
   }
-  if (invokeClosed && closedCb) {
-    closedCb();
-  }
-  // Defocus any hosted text input (proper focus-loss / IME deactivation) before the focus area
-  // node is destroyed by removeChild.
-  instance.inputDispatcher.setFocus(nullptr);
-  if (clip != nullptr && instance.slideRoot != nullptr) {
-    instance.slideRoot->removeChild(clip);
-  }
-}
 
-bool Bar::reopenHostedAttachedPanel(wl_output* output, std::string_view barName) {
-  BarInstance* inst = instanceForBar(output, barName);
-  if (inst == nullptr || inst->surface == nullptr || !inst->hostedPanelOpen || inst->hostedPanelClip == nullptr) {
-    return false;
+  if (parts.empty() || parts.size() > 3) {
+    return "error: usage: bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]\n";
   }
-  // The panel is mid-close (retract in progress) but its content is still intact. Cancel the
-  // retract and re-reveal it instead of tearing down and recreating — no flicker, no relayout.
-  inst->animations.cancelForOwner(&inst->hostedPanelOpen);
-  inst->surface->setKeyboardInteractivity(LayerShellKeyboard::Exclusive);
-  armHostedPanelKeyboardRelax(*inst);
-  inst->animations.animate(
-      inst->hostedPanelProgress, 1.0f, Style::animSlow, Easing::EaseOutCubic,
-      [this, inst](float v) {
-        inst->hostedPanelProgress = v;
-        applyHostedPanelReveal(*inst, v);
-      },
-      {}, &inst->hostedPanelOpen
-  );
-  inst->surface->requestRedraw();
-  return true;
-}
 
-void Bar::closeHostedAttachedPanel(wl_output* output, std::string_view barName) {
-  if (m_config == nullptr) {
-    return;
+  const std::string action = parts[0];
+  if (action != "open" && action != "close" && action != "cycle") {
+    return "error: action must be one of: open, close, cycle\n";
   }
-  BarInstance* inst = instanceForBar(output, barName);
-  if (inst == nullptr || inst->surface == nullptr || !inst->hostedPanelOpen) {
-    return;
+  if (action == "close" && explicitSize) {
+    return "error: size=<px> is only valid with open or cycle\n";
   }
-  inst->animations.cancelForOwner(&inst->hostedPanelOpen);
-  // Release keyboard interactivity now, at the START of the retract — not when teardown completes.
-  // The caller (e.g. openSettingsWindow) opens its own surface right after closePanel, so deferring
-  // the release to the end of the retract animation makes the bar flip to None ~animSlow later,
-  // which triggers a compositor focus re-evaluation that steals keyboard focus back from the surface
-  // that opened in the meantime. Releasing eagerly hands focus straight to the next surface.
-  inst->surface->setKeyboardInteractivity(LayerShellKeyboard::None);
-  inst->animations.animate(
-      inst->hostedPanelProgress, 0.0f, Style::animSlow, Easing::EaseInOutCubic,
-      [this, inst](float v) {
-        inst->hostedPanelProgress = v;
-        applyHostedPanelReveal(*inst, v);
-      },
-      [this, inst] { tearDownHostedPanel(*inst, true); }, &inst->hostedPanelOpen
-  );
-  inst->surface->requestRedraw();
-}
 
-void Bar::tearDownHostedAttachedPanelImmediate(wl_output* output, std::string_view barName) {
-  BarInstance* inst = instanceForBar(output, barName);
-  if (inst != nullptr) {
-    tearDownHostedPanel(*inst, false);
+  std::optional<std::string_view> barName;
+  std::optional<std::string_view> monitorSelector;
+  if (parts.size() >= 2) {
+    barName = parts[1];
   }
+  if (parts.size() >= 3) {
+    monitorSelector = parts[2];
+  }
+
+  std::vector<BarInstance*> targets;
+  if (const auto collectError = collectBarIpcInstances(barName, monitorSelector, targets)) {
+    return *collectError;
+  }
+
+  if (action != "close") {
+    std::uint32_t maxExtent = kAttachedPanelResizeTestMaxExtent;
+    for (const BarInstance* instance : targets) {
+      if (instance == nullptr) {
+        continue;
+      }
+      maxExtent = std::min(maxExtent, attachedPanelResizeTestMaxExtent(*instance));
+    }
+    if (extent > maxExtent) {
+      return "error: size="
+          + std::to_string(extent)
+          + " exceeds available inner-axis space for at least one target (max "
+          + std::to_string(maxExtent)
+          + ")\n";
+    }
+  }
+
+  if (action == "close") {
+    for (BarInstance* instance : targets) {
+      if (instance != nullptr) {
+        setAttachedPanelResizeTestOpen(*instance, false, 0);
+      }
+    }
+    return "ok: attached panel resize test closed on " + std::to_string(targets.size()) + " bar instance(s)\n";
+  }
+
+  for (BarInstance* instance : targets) {
+    if (instance == nullptr) {
+      continue;
+    }
+    setAttachedPanelResizeTestOpen(*instance, true, extent);
+    if (action == "cycle") {
+      instance->animations.animateTimer(
+          0.0f, 1.0f, kAttachedPanelResizeTestCycleHoldMs, Easing::Linear, [](float) {},
+          [this, instance] { setAttachedPanelResizeTestOpen(*instance, false, 0); },
+          &instance->attachedPanelResizeTestOpen
+      );
+      if (instance->surface != nullptr) {
+        instance->surface->requestRedraw();
+      }
+    }
+  }
+
+  return "ok: attached panel resize test "
+      + action
+      + " on "
+      + std::to_string(targets.size())
+      + " bar instance(s), size="
+      + std::to_string(extent)
+      + "\n";
 }
 
 void Bar::registerIpc(IpcService& ipc) {
@@ -3628,5 +3186,12 @@ void Bar::registerIpc(IpcService& ipc) {
   ipc.registerHandler(
       "bar-auto-hide-set", [this](const std::string& args) -> std::string { return setBarAutoHideIpc(args); },
       "bar-auto-hide-set <on|off|true|false|1|0> [bar-name] [monitor-selector]", "Set auto-hide state for a bar"
+  );
+
+  ipc.registerHandler(
+      "bar-attached-resize-test",
+      [this](const std::string& args) -> std::string { return attachedPanelResizeTestIpc(args); },
+      "bar-attached-resize-test <open|close|cycle> [bar-name] [monitor-selector] [size=<px>]",
+      "Exercise live bar-surface resize for attached-panel validation", IpcService::HandlerVisibility::Hidden
   );
 }

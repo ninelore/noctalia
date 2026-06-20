@@ -867,6 +867,10 @@ BarConfig ConfigService::resolveForOutput(const BarConfig& base, const WaylandOu
       resolved.widgetSpacing = *ovr.widgetSpacing;
     if (ovr.shadow)
       resolved.shadow = *ovr.shadow;
+    if (ovr.contactShadow)
+      resolved.contactShadow = *ovr.contactShadow;
+    if (ovr.panelOverlap)
+      resolved.panelOverlap = *ovr.panelOverlap;
     if (ovr.capsuleThickness)
       resolved.capsuleThickness = *ovr.capsuleThickness;
     if (ovr.fontFamily)

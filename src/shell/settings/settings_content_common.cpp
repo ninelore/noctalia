@@ -86,6 +86,9 @@ namespace settings {
     if (key == "shadow") {
       return override->shadow.has_value();
     }
+    if (key == "panel_overlap") {
+      return override->panelOverlap.has_value();
+    }
     if (key == "widget_spacing") {
       return override->widgetSpacing.has_value();
     }

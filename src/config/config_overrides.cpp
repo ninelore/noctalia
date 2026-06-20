@@ -212,6 +212,12 @@ namespace {
     if (ovr.shadow) {
       resolved.shadow = *ovr.shadow;
     }
+    if (ovr.contactShadow) {
+      resolved.contactShadow = *ovr.contactShadow;
+    }
+    if (ovr.panelOverlap) {
+      resolved.panelOverlap = *ovr.panelOverlap;
+    }
     if (ovr.capsuleThickness) {
       resolved.capsuleThickness = *ovr.capsuleThickness;
     }

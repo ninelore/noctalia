@@ -1382,6 +1382,9 @@
           "description": "Widgets in the center of the bar",
           "label": "Center Widgets"
         },
+        "contact-shadow": {
+          "description": "Dark gradient between an attached panel and the bar to suggest depth at the seam"
+        },
         "content-padding": {
           "description": "Padding inside the bar content area",
           "label": "Content Padding"
@@ -1429,6 +1432,10 @@
         "layer": {
           "description": "Use Overlay to show the bar above fullscreen apps. Attached panels follow the bar.",
           "label": "Wayland Layer"
+        },
+        "panel-overlap": {
+          "description": "Pixels an attached panel overlaps the bar edge to hide the seam (adjust if you see a line or gap)",
+          "label": "Panel Overlap"
         },
         "position": {
           "description": "Which screen edge the bar sits on"
@@ -2074,6 +2081,9 @@
         },
         "background-opacity": {
           "label": "Background Opacity"
+        },
+        "contact-shadow": {
+          "label": "Contact Shadow"
         },
         "corner-bottom-left": {
           "label": "Bottom Left Radius"
