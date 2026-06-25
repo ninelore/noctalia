@@ -1833,7 +1833,9 @@ void TaskbarWidget::updateModels() {
       }
       return false;
     };
-    std::erase_if(nextWorkspaces, [&](const WorkspaceModel& wsm) { return !workspaceHasTask(wsm, nextTasks); });
+    std::erase_if(nextWorkspaces, [&](const WorkspaceModel& wsm) {
+      return !wsm.workspace.active && !workspaceHasTask(wsm, nextTasks);
+    });
   }
 
   if (!m_groupByWorkspace) {

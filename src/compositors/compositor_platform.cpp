@@ -1163,16 +1163,10 @@ bool CompositorPlatform::supportsTaskbarWorkspaceGrouping() const noexcept {
     return true;
   }
 
-  const auto hasWorkspaceWindowRows = [](const std::vector<WorkspaceWindow>& windows) {
-    return std::ranges::any_of(windows, [](const WorkspaceWindow& window) {
-      return !window.windowId.empty() && !window.workspaceKey.empty();
-    });
-  };
-  if (m_workspaces != nullptr && hasWorkspaceWindowRows(m_workspaces->workspaceWindows(nullptr))) {
+  if (m_workspaces != nullptr && std::string_view(m_workspaces->backendName()) != "none") {
     return true;
   }
-  if (m_workspaceMetadataBackend != nullptr
-      && hasWorkspaceWindowRows(m_workspaceMetadataBackend->workspaceWindows({}))) {
+  if (m_workspaceMetadataBackend != nullptr && !m_workspaceMetadataBackend->workspaceKeys({}).empty()) {
     return true;
   }
   return false;
